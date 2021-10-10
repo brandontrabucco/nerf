@@ -250,16 +250,13 @@ class NeRF(nn.Module):
                 rays_d.unsqueeze(-2) * samples.unsqueeze(-1))
 
     @staticmethod
-    def alpha_compositing_coefficients(rays_d, points, density_outputs):
+    def alpha_compositing_coefficients(points, density_outputs):
         """Generate coefficients for alpha compositing along a set of points
         sampled along each ray in order to produce an rgb image, where the
         volumetric density is evaluated densely at all points
 
         Arguments:
 
-        rays_d: torch.Tensor
-            a batch or ray directions in world coordinates, represented as
-            3-vectors and paired with a batch of ray locations
         points: torch.Tensor
             num_samples points generated along each ray defined by rays_o and
             rays_d between the near and far clipping planes
@@ -277,9 +274,9 @@ class NeRF(nn.Module):
 
         # record the distances between adjacent points along each rays
         # where the final distance is infinity because there is one point
-        dists = (torch.norm(rays_d, dim=-1, keepdim=True) *
-                 functional.pad(points[..., 1:] -
-                                points[..., :-1], (0, 1), value=1e10))
+        dists = points[..., 1:, :] - points[..., :-1, :]
+        dists = functional.pad(torch.norm(dists, dim=-1, keepdim=True),
+                               (0, 0, 0, 1), value=1e10)
 
         # generate coefficients for alpha compositing across each ray
         alpha = 1.0 - torch.exp(-functional.relu(density_outputs) * dists)
@@ -292,8 +289,8 @@ class NeRF(nn.Module):
         volumetric density at every point along the rays, which enables
         hierarchical sampling of evaluation points
 
-        See: https://github.com/bmild/nerf/blob/
-        20a91e764a28816ee2234fcadb73bd59a613a44c/run_nerf_helpers.py#L183
+        See: https://github.com/yenchenlin/nerf-pytorch/blob/
+        62da0b218b41573535a59ac1a38e9aeb840385a2/run_nerf_helpers.py#L196
 
         Arguments:
 
@@ -470,9 +467,17 @@ class NeRF(nn.Module):
 
         """
 
-        # embed the position and direction into positional encodings
-        x_embed = self.positional_encoding(x, self.x_positional_encoding_size)
-        d_embed = self.positional_encoding(d, self.d_positional_encoding_size)
+        # embed the position in a high dimensional positional encoding
+        x_shape = list(x.shape)
+        x_shape[-1] *= self.x_positional_encoding_size
+        x_embed = self.positional_encoding(
+            x, self.x_positional_encoding_size).reshape(*x_shape)
+
+        # embed the direction in a high dimensional positional encoding
+        d_shape = list(d.shape)
+        d_shape[-1] *= self.d_positional_encoding_size
+        d_embed = self.positional_encoding(
+            d, self.d_positional_encoding_size).reshape(*d_shape)
 
         # perform a forward pass on several fully connected layers
         block_0 = self.block_0(x_embed)
