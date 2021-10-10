@@ -181,10 +181,10 @@ class NeRF(nn.Module):
         Returns:
 
         rays_o: torch.Tensor
-            a batch or ray locations in world coordinates, represented
+            a batch of ray locations in world coordinates, represented
             as 3-vectors and paired with a batch of ray directions
         rays_d: torch.Tensor
-            a batch or ray directions in world coordinates, represented
+            a batch of ray directions in world coordinates, represented
             as 3-vectors and paired with a batch of ray locations
 
         """
@@ -203,10 +203,10 @@ class NeRF(nn.Module):
         Arguments:
 
         rays_o: torch.Tensor
-            a batch or ray locations in world coordinates, represented
+            a batch of ray locations in world coordinates, represented
             as 3-vectors and paired with a batch of ray directions
         rays_d: torch.Tensor
-            a batch or ray directions in world coordinates, represented
+            a batch of ray directions in world coordinates, represented
             as 3-vectors and paired with a batch of ray locations
         near: float
             the distance in world coordinates of the near plane from the
@@ -412,10 +412,10 @@ class NeRF(nn.Module):
         Arguments:
 
         rays_o: torch.Tensor
-            a batch or ray locations in world coordinates, represented
+            a batch of ray locations in world coordinates, represented
             as 3-vectors and paired with a batch of ray directions
         rays_d: torch.Tensor
-            a batch or ray directions in world coordinates, represented
+            a batch of ray directions in world coordinates, represented
             as 3-vectors and paired with a batch of ray locations
         near: float
             the distance in world coordinates of the near plane from the
