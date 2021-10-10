@@ -191,10 +191,11 @@ class NeRF(nn.Module):
 
         # the ray origins are the camera origins, and the ray viewing
         # directions are rotated by the given rotation matrix
-        return camera_o, torch.matmul(camera_r, rays.unsqueeze(-1))[..., 0]
+        return camera_o, (camera_r * rays.unsqueeze(-2)).sum(dim=-1)
 
     @staticmethod
-    def sample_along_rays(rays_o, rays_d, near, far, num_samples):
+    def sample_along_rays(rays_o, rays_d,
+                          near, far, num_samples, random=True):
         """Generate a set of stratified samples along each ray by first
         splitting the ray into num_samples bins between near and far clipping
         planes, and then sampling uniformly from each bin
@@ -236,14 +237,21 @@ class NeRF(nn.Module):
         sample_bins = torch.broadcast_to(
             sample_bins, list(rays_o.shape[:-1]) + [num_samples])
 
-        # convert bins to upper and lower bounds of a uniform distribution
-        midpoints = 0.5 * (sample_bins[..., 1:] + sample_bins[..., :-1])
-        lower_bounds = torch.cat([sample_bins[..., :1], midpoints], dim=-1)
-        upper_bounds = torch.cat([midpoints, sample_bins[..., -1:]], dim=-1)
+        if random:
 
-        # sample points along each ray uniformly over the bins
-        samples = torch.rand(*sample_bins.shape, **kwargs)
-        samples = lower_bounds + (upper_bounds - lower_bounds) * samples
+            # convert to upper and lower bounds of a uniform distribution
+            midpoints = 0.5 * (sample_bins[..., 1:] + sample_bins[..., :-1])
+            lower = torch.cat([sample_bins[..., :1], midpoints], dim=-1)
+            upper = torch.cat([midpoints, sample_bins[..., -1:]], dim=-1)
+
+            # sample points along each ray uniformly over the bins
+            samples = torch.rand(*sample_bins.shape, **kwargs)
+            samples = lower + (upper - lower) * samples
+
+        else:
+
+            # use a deterministic set of ray samples for testing
+            samples = sample_bins
 
         # generate points in 3D space along each ray using samples
         return (rays_o.unsqueeze(-2) +
@@ -275,16 +283,16 @@ class NeRF(nn.Module):
         # record the distances between adjacent points along each rays
         # where the final distance is infinity because there is one point
         dists = points[..., 1:, :] - points[..., :-1, :]
-        dists = functional.pad(torch.norm(dists, dim=-1, keepdim=True),
-                               (0, 0, 0, 1), value=1e10)
+        dists = functional.pad(torch.linalg.norm(
+            dists, dim=-1, keepdim=True), (0, 0, 0, 1), value=1e10)
 
         # generate coefficients for alpha compositing across each ray
-        alpha = 1.0 - torch.exp(-functional.relu(density_outputs) * dists)
-        return alpha * functional.pad(torch.cumprod(
-            1.0 - alpha[..., :-1] + 1e-10, dim=-1), (0, 1), value=1.0)
+        alpha = torch.exp(-functional.relu(density_outputs) * dists)
+        return (1.0 - alpha) * functional.pad(torch.cumprod(
+            alpha[..., :-1, :] + 1e-10, dim=-2), (0, 0, 1, 0), value=1.0)
 
     @staticmethod
-    def hierarchical_volume_sampling(points, weights, num_samples):
+    def hierarchical_volume_sampling(points, weights, num_samples, random=True):
         """Sample from the empirical distribution of points weighted by the
         volumetric density at every point along the rays, which enables
         hierarchical sampling of evaluation points
@@ -314,7 +322,7 @@ class NeRF(nn.Module):
 
         # create bins for sampling points using importance weights
         # noting bins are chosen to be the midpoints of existing points
-        bins = 0.5 * (points[..., 1:] + points[..., :-1])
+        bins = 0.5 * (points[..., 1:, :] + points[..., :-1, :])
         weights = weights[..., 1:-1, 0] + 1e-5
         kwargs = dict(dtype=points.dtype, device=points.device)
 
@@ -323,8 +331,16 @@ class NeRF(nn.Module):
         cdf = torch.cumsum(pdf, -1)
         cdf = torch.cat([torch.zeros_like(cdf[..., :1], **kwargs), cdf], -1)
 
-        # generate samples uniformly at random from inverse cdf
-        u = torch.rand(list(cdf.shape[:-1]) + [num_samples], **kwargs)
+        if random:
+
+            # generate samples uniformly at random from inverse cdf
+            u = torch.rand(list(cdf.shape[:-1]) + [num_samples], **kwargs)
+
+        else:
+
+            # use a deterministic set of samples for testing purposes
+            u = torch.linspace(0., 1., steps=num_samples)
+            u = u.expand(list(cdf.shape[:-1]) + [num_samples])
 
         # search which bin index the uniform sample falls into
         idx = torch.searchsorted(cdf, u, right=True)
@@ -358,16 +374,13 @@ class NeRF(nn.Module):
         return (bin_bounds[..., 0] +
                 u * (bin_bounds[..., 1] - bin_bounds[..., 0]))
 
-    def __init__(self, output_init_scale=3e-3, hidden_size=256,
-                 density_inputs=3, color_inputs=3, color_outputs=3,
-                 x_positional_encoding_size=20,
+    def __init__(self, density_inputs=3, color_inputs=3, color_outputs=3,
+                 hidden_size=128, x_positional_encoding_size=20,
                  d_positional_encoding_size=12):
         """Create a neural network model that learns a Neural Radiance Field
         by mapping positions and camera orientations in 3D space into the
         RBG and density values of a Neural Radiance Field (NeRF)
-
         Arguments:
-
         output_init_scale: float
             the scale of the weights in the final layer of each of the
             density and color prediction heads of the model
@@ -389,14 +402,11 @@ class NeRF(nn.Module):
         color_outputs: int
             the number of outputs made by the network representing color
             and should typically be set to three
-
         """
 
         super(NeRF, self).__init__()
 
         # hyper-parameters that define the network construction
-        self.output_init_scale = output_init_scale
-        self.hidden_size = hidden_size
         self.density_inputs = density_inputs
         self.color_inputs = color_inputs
         self.density_outputs = 1
@@ -413,34 +423,23 @@ class NeRF(nn.Module):
 
         # a final fully connected layer that outputs opacity
         self.density = nn.Linear(hidden_size, self.density_outputs)
-        self.density.bias.data.fill_(0)
-        self.density.weight.data.uniform_(
-            -output_init_scale, output_init_scale)
-
-        # a final fully connected layer that outputs color
         self.color = nn.Linear(hidden_size, self.color_outputs)
-        self.color.bias.data.fill_(0)
-        self.color.weight.data.uniform_(
-            -output_init_scale, output_init_scale)
+        self.hidden_size = hidden_size
 
         # a neural network block that processes position
         self.block_0 = nn.Sequential(
-            nn.Linear(self.x_size, hidden_size),
-            nn.Linear(hidden_size, hidden_size),
-            nn.Linear(hidden_size, hidden_size),
-            nn.Linear(hidden_size, hidden_size),
-            nn.Linear(hidden_size, hidden_size))
+            nn.Linear(self.x_size, hidden_size), nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size), nn.ReLU())
 
         # a neural network block with a skip connection
         self.block_1 = nn.Sequential(
-            nn.Linear(self.x_size + hidden_size, hidden_size),
-            nn.Linear(hidden_size, hidden_size),
-            nn.Linear(hidden_size, hidden_size))
+            nn.Linear(self.x_size + hidden_size, hidden_size), nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size), nn.ReLU())
 
         # a neural network block that processes direction
         self.block_2 = nn.Sequential(
-            nn.Linear(self.d_size + hidden_size, hidden_size),
-            nn.Linear(hidden_size, hidden_size))
+            nn.Linear(self.d_size + hidden_size, hidden_size), nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size), nn.ReLU())
 
     def forward(self, x, d):
         """Perform a forward pass on a Neural Radiance Field given a position
@@ -486,3 +485,94 @@ class NeRF(nn.Module):
 
         # final activation functions to output density and color
         return self.density(block_1), self.color(block_2)
+
+    def render_image(self, pose, image_h, image_w, focal_length,
+                     near, far, num_samples, max_chunk_size=1024,
+                     random=False, density_noise_std=0.0, pose_limit=6.0):
+        """Render an image with the specified height and width using a camera
+        with the specified pose and focal length using a neural radiance
+        field evaluated densely at points along rays through the scene
+
+        Arguments:
+
+        pose: torch.Tensor
+            a batch of camera poses represented as a 4x4 matrix in homogeneous
+            coordinates containing the camera position and rotation
+        image_h: int
+            an integer that described the height of the imaging plane in
+            pixels and determines the number of rays sampled vertically
+        image_w: int
+            an integer that described the width of the imaging plane in
+            pixels and determines the number of rays sampled horizontally
+        focal_length: float
+            the focal length of the pinhole camera, which corresponds to
+            the physical distance from the camera to the imaging plane
+        near: float
+            the distance in world coordinates of the near plane from the
+            camera origin along the ray defined by rays_d
+        far: float
+            the distance in world coordinates of the far plane from the
+            camera origin along the ray defined by rays_d
+        num_samples: int
+            the number of samples along each ray to generate by sampling
+            uniformly from num_samples bins between clipping planes
+
+        Returns:
+
+        image: torch.Tensor
+            an image tensor with the specified height and width rendered
+            using alpha compositing with a neural radiance field
+
+        """
+
+        # generate all possible rays to cast through the scene
+        kwargs = dict(dtype=pose.dtype, device=pose.device)
+        rays = self.generate_rays(image_h, image_w, focal_length, **kwargs)
+
+        # ensure the rays and pose have compatible shape, by adding a
+        # batch size dimension to the rays tensor and spatial size to pose
+        rays = torch.broadcast_to(rays.unsqueeze(0),
+                                  [pose.shape[0], image_h, image_w, 3])
+        pose = torch.broadcast_to(pose.unsqueeze(1).unsqueeze(1),
+                                  [pose.shape[0], image_h, image_w, 4, 4])
+
+        # transform the rays to the world coordinate system using pose
+        rays_o, rays_d = self.rays_to_world_coordinates(
+            rays, pose[..., :3, 3], pose[..., :3, :3])
+
+        # flatten the batch size with the spatial size for batching
+        rays_o = torch.flatten(rays_o, start_dim=0, end_dim=2)
+        rays_d = torch.flatten(rays_d, start_dim=0, end_dim=2)
+
+        # shard the rendering process in case the image is too large
+        # or we are generating many samples along each ray
+        image = []
+        for rays_o_i, rays_d_i in zip(torch.split(rays_o, max_chunk_size),
+                                      torch.split(rays_d, max_chunk_size)):
+
+            # generate samples along each ray
+            points = self.sample_along_rays(rays_o_i, rays_d_i, near,
+                                            far, num_samples, random=random)
+
+            # normalize the viewing direction of the camera and add
+            # an additional dimension of ray samples
+            rays_d_i = rays_d_i / torch.linalg.norm(rays_d_i,
+                                                    dim=-1, keepdim=True)
+            rays_d_i = torch.broadcast_to(rays_d_i.unsqueeze(-2),
+                                          [points.shape[0], num_samples, 3])
+
+            # predict a density and color for every point along each ray
+            # potentially add random noise to each density prediction
+            density, color = self.forward(points / pose_limit, rays_d_i)
+            density += torch.randn(density.shape,
+                                   **kwargs) * density_noise_std
+
+            # generate alpha compositing coefficients along each ray and
+            # and composite the color values onto the imaging plane
+            weights = self.alpha_compositing_coefficients(points, density)
+            image.append((torch.sigmoid(color) * weights).sum(dim=-2))
+
+        # merge the sharded predictions into a single image and
+        # inflate the tensor to have the correct shape
+        return torch.cat(image, dim=0).reshape(pose.shape[0],
+                                               image_h, image_w, 3)
