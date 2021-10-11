@@ -11,9 +11,6 @@ class NeRF(nn.Module):
 
     Arguments:
 
-    output_init_scale: float
-        the scale of the weights in the final layer of each of the
-        density and color prediction heads of the model
     hidden_size: int
         an integer that represents the hidden size of each hidden layer
         in each fully connected layer in the model
@@ -32,6 +29,9 @@ class NeRF(nn.Module):
     color_outputs: int
         the number of outputs made by the network representing color
         and should typically be set to three
+    learn_cdf_for_volume_sampling: bool
+        whether to use a learned inverse cdf transform for sampling
+        points to evaluate radiance along each ray
 
     """
 
@@ -51,7 +51,7 @@ class NeRF(nn.Module):
 
         embedding: torch.Tensor
             a frequency encoding with the same shape as x, but with
-            an additional dimension of size d_model appended to the end
+            a d_model times larger dimension at the end
 
         """
 
@@ -197,7 +197,7 @@ class NeRF(nn.Module):
         return camera_o, (camera_r * rays.unsqueeze(-2)).sum(dim=-1)
 
     def sample_along_rays(self, rays_o, rays_d, near, far,
-                          num_samples, random=True, pose_limit=6.0):
+                          num_samples, randomly_sample=True):
         """Generate a set of stratified samples along each ray by first
         splitting the ray into num_samples bins between near and far clipping
         planes, and then sampling uniformly from each bin
@@ -219,6 +219,9 @@ class NeRF(nn.Module):
         num_samples: int
             the number of samples along each ray to generate by sampling
             uniformly from num_samples bins between clipping planes
+        randomly_sample: bool
+            whether to randomly sample the evaluation positions along each
+            ray or to use a deterministic set of points
 
         Returns:
 
@@ -239,7 +242,7 @@ class NeRF(nn.Module):
         samples = torch.broadcast_to(
             samples, list(rays_o.shape[:-1]) + [num_samples])
 
-        if random:
+        if randomly_sample:
 
             # calculate the midpoints between each sample along the ray
             midpoints = 0.5 * (samples[..., 1:] + samples[..., :-1])
@@ -252,7 +255,7 @@ class NeRF(nn.Module):
             samples = torch.rand(*samples.shape, **kwargs)
             samples = lower + (upper - lower) * samples
 
-        if self.learn_cdf:
+        if self.learn_cdf_for_volume_sampling:
 
             # embed the position in a high dimensional positional encoding
             x_embed = self.positional_encoding(
@@ -322,16 +325,14 @@ class NeRF(nn.Module):
 
     def __init__(self, density_inputs=3, color_inputs=3, color_outputs=3,
                  hidden_size=128, x_positional_encoding_size=20,
-                 d_positional_encoding_size=12, normalize_position=1.0):
+                 d_positional_encoding_size=12, normalize_position=1.0,
+                 learn_cdf_for_volume_sampling=True):
         """Create a neural network model that learns a Neural Radiance Field
         by mapping positions and camera orientations in 3D space into the
         RBG and density values of a Neural Radiance Field (NeRF)
 
         Arguments:
 
-        output_init_scale: float
-            the scale of the weights in the final layer of each of the
-            density and color prediction heads of the model
         hidden_size: int
             an integer that represents the hidden size of each hidden layer
             in each fully connected layer in the model
@@ -350,6 +351,9 @@ class NeRF(nn.Module):
         color_outputs: int
             the number of outputs made by the network representing color
             and should typically be set to three
+        learn_cdf_for_volume_sampling: bool
+            whether to use a learned inverse cdf transform for sampling
+            points to evaluate radiance along each ray
 
         """
 
@@ -392,23 +396,23 @@ class NeRF(nn.Module):
             nn.Linear(hidden_size, hidden_size), nn.ReLU())
 
         # layers for parameterizing the cdf over points to sample
-        self.learn_cdf = True
+        self.learn_cdf_for_volume_sampling = learn_cdf_for_volume_sampling
         self.cdf_params = nn.Sequential(
             nn.Linear(self.x_size + self.d_size, hidden_size), nn.ReLU(),
             nn.Linear(hidden_size,
                       hidden_size), nn.ReLU(), nn.Linear(hidden_size, 2))
 
-    def forward(self, x, d):
+    def forward(self, ray_x, ray_d):
         """Perform a forward pass on a Neural Radiance Field given a position
         and viewing direction, and predict both the density of the position
         and the color of the position and viewing direction
 
         Arguments:
 
-        x: torch.Tensor
+        ray_x: torch.Tensor
             an input vector that represents the positions in 3D space the
             NeRF model is evaluated at, using a positional encoding
-        d: torch.Tensor
+        ray_d: torch.Tensor
             an input vector that represents the viewing direction the NeRF
             model is evaluated at, using a positional encoding
 
@@ -425,11 +429,11 @@ class NeRF(nn.Module):
 
         # embed the position in a high dimensional positional encoding
         x_embed = self.positional_encoding(
-            x / self.normalize_position, self.x_positional_encoding_size)
+            ray_x / self.normalize_position, self.x_positional_encoding_size)
 
         # embed the direction in a high dimensional positional encoding
-        d_embed = self.positional_encoding(d / torch.linalg.norm(
-            d, dim=-1, keepdim=True), self.d_positional_encoding_size)
+        d_embed = self.positional_encoding(ray_d / torch.linalg.norm(
+            ray_d, dim=-1, keepdim=True), self.d_positional_encoding_size)
 
         # perform a forward pass on several fully connected layers
         block_0 = self.block_0(x_embed)
@@ -440,7 +444,7 @@ class NeRF(nn.Module):
         return self.density(block_1), self.color(block_2)
 
     def render_rays(self, rays_o, rays_d, near, far, num_samples,
-                    random=False, density_noise_std=0.0):
+                    randomly_sample=False, density_noise_std=0.0):
         """Render pixels in the imaging plane for a batch of rays given the
         specified parameters of the near and far clipping planes by alpha
         compositing colors predicted by a neural radiance field
@@ -462,6 +466,12 @@ class NeRF(nn.Module):
         num_samples: int
             the number of samples along each ray to generate by sampling
             uniformly from num_samples bins between clipping planes
+        randomly_sample: bool
+            whether to randomly sample the evaluation positions along each
+            ray or to use a deterministic set of points
+        density_noise_std: float
+            the standard deviation of gaussian noise added to the density
+            predictions made by the model before alpha compositing
 
         Returns:
 
@@ -473,8 +483,9 @@ class NeRF(nn.Module):
 
         # generate samples along each ray
         kwargs = dict(dtype=rays_d.dtype, device=rays_d.device)
-        points = self.sample_along_rays(rays_o, rays_d, near,
-                                        far, num_samples, random=random)
+        points = self.sample_along_rays(rays_o, rays_d,
+                                        near, far, num_samples,
+                                        randomly_sample=randomly_sample)
 
         # normalize the viewing direction of the camera and add
         # an additional dimension of ray samples
@@ -494,7 +505,7 @@ class NeRF(nn.Module):
 
     def render_image(self, pose, image_h, image_w, focal_length,
                      near, far, num_samples, max_chunk_size=1024,
-                     random=False, density_noise_std=0.0):
+                     randomly_sample=False, density_noise_std=0.0):
         """Render an image with the specified height and width using a camera
         with the specified pose and focal length using a neural radiance
         field evaluated densely at points along rays through the scene
@@ -522,6 +533,15 @@ class NeRF(nn.Module):
         num_samples: int
             the number of samples along each ray to generate by sampling
             uniformly from num_samples bins between clipping planes
+        max_chunk_size: int
+            the maximum number of elements in a single batch chunk to process
+            in parallel, in order to save memory for large images
+        randomly_sample: bool
+            whether to randomly sample the evaluation positions along each
+            ray or to use a deterministic set of points
+        density_noise_std: float
+            the standard deviation of gaussian noise added to the density
+            predictions made by the model before alpha compositing
 
         Returns:
 
@@ -560,7 +580,8 @@ class NeRF(nn.Module):
             # each pixel, and then append pixels to an image buffer
             image.append(self.render_rays(
                 rays_o_i, rays_d_i, near, far, num_samples,
-                random=random, density_noise_std=density_noise_std))
+                randomly_sample=randomly_sample,
+                density_noise_std=density_noise_std))
 
         # merge the sharded predictions into a single image and
         # inflate the tensor to have the correct shape
