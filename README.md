@@ -61,6 +61,7 @@ with torch.no_grad():
         random=random, 
         density_noise_std=density_noise_std, 
         pose_limit=pose_limit)
+        
 ```
 
 ## Training
@@ -74,7 +75,6 @@ import torch
 
 # build the NeRF model with default parameters
 model = NeRF().cuda()
-optimizer = optim.Adam(model.parameters(), lr=0.001)
 
 # distanced of the clipping planes along the cameta z axis
 near = 2.0
@@ -115,10 +115,6 @@ for target, rays_o, rays_d in data_loader:
     # mean squared error in pixels
     loss = ((pixels - target) ** 2).mean()
     
-    # update the NeRF model with gradient descent
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
 ```
 
 ## Citation
