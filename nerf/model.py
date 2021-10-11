@@ -65,8 +65,11 @@ class NeRF(nn.Module):
             frequency_scale = frequency_scale.unsqueeze(0)
 
         # generate a sine and cosine embedding for each value in x
-        return torch.cat([torch.sin(x * frequency_scale),
-                          torch.cos(x * frequency_scale)], dim=-1)
+        embedding = torch.cat([torch.sin(x * frequency_scale),
+                               torch.cos(x * frequency_scale)], dim=-1)
+
+        # flatten the features and positional embedding axes
+        return torch.flatten(embedding, start_dim=-2, end_dim=-1)
 
     @staticmethod
     def generate_rays(image_h, image_w, focal_length,
@@ -193,9 +196,8 @@ class NeRF(nn.Module):
         # directions are rotated by the given rotation matrix
         return camera_o, (camera_r * rays.unsqueeze(-2)).sum(dim=-1)
 
-    @staticmethod
-    def sample_along_rays(rays_o, rays_d,
-                          near, far, num_samples, random=True):
+    def sample_along_rays(self, rays_o, rays_d, near, far,
+                          num_samples, random=True, pose_limit=6.0):
         """Generate a set of stratified samples along each ray by first
         splitting the ray into num_samples bins between near and far clipping
         planes, and then sampling uniformly from each bin
@@ -230,7 +232,7 @@ class NeRF(nn.Module):
         # to the same device with the same data type as rays_o
         reshape_shape = [1 for _ in range(len(rays_o.shape[:-1]))]
         kwargs = dict(dtype=rays_o.dtype, device=rays_o.device)
-        samples = torch.linspace(near, far, num_samples, **kwargs)
+        samples = torch.linspace(0.0, 1.0, num_samples, **kwargs)
 
         # broadcast the sample bins to a compatible shape with rays_o
         samples = samples.reshape(*(reshape_shape + [num_samples]))
@@ -249,6 +251,36 @@ class NeRF(nn.Module):
             # sample points along each ray uniformly over the bins
             samples = torch.rand(*samples.shape, **kwargs)
             samples = lower + (upper - lower) * samples
+
+        if self.learn_cdf:
+
+            # embed the position in a high dimensional positional encoding
+            x_embed = self.positional_encoding(
+                rays_o / self.normalize_position,
+                self.x_positional_encoding_size)
+
+            # embed the direction in a high dimensional positional encoding
+            d_embed = self.positional_encoding(
+                rays_d / torch.linalg.norm(rays_d, dim=-1, keepdim=True),
+                self.d_positional_encoding_size)
+
+            # perform a forward pass on several fully connected layers
+            params = self.cdf_params(torch.cat([x_embed, d_embed], dim=-1))
+
+            # final activation functions to output cdf parameters
+            a = torch.exp(params[..., 0:1])
+            b = torch.sigmoid(params[..., 1:2])
+
+            # values for scaling the cdf between 0 and 1
+            z0 = torch.sigmoid(-a * b)
+            z1 = torch.sigmoid(a * (1.0 - b))
+
+            # pass samples through an inverse cdf transform
+            samples = torch.logit((z1 - z0) *
+                                  samples + z0, eps=1e-6) / a + b
+
+        # scale samples between near and far clipping bounds
+        samples = near + samples * (far - near)
 
         # generate points in 3D space along each ray using samples
         return (rays_o.unsqueeze(-2) +
@@ -290,7 +322,7 @@ class NeRF(nn.Module):
 
     def __init__(self, density_inputs=3, color_inputs=3, color_outputs=3,
                  hidden_size=128, x_positional_encoding_size=20,
-                 d_positional_encoding_size=12):
+                 d_positional_encoding_size=12, normalize_position=1.0):
         """Create a neural network model that learns a Neural Radiance Field
         by mapping positions and camera orientations in 3D space into the
         RBG and density values of a Neural Radiance Field (NeRF)
@@ -328,6 +360,7 @@ class NeRF(nn.Module):
         self.color_inputs = color_inputs
         self.density_outputs = 1
         self.color_outputs = color_outputs
+        self.normalize_position = normalize_position
 
         # record the size of inputs to the network and
         # corresponding positional encodings
@@ -358,6 +391,13 @@ class NeRF(nn.Module):
             nn.Linear(self.d_size + hidden_size, hidden_size), nn.ReLU(),
             nn.Linear(hidden_size, hidden_size), nn.ReLU())
 
+        # layers for parameterizing the cdf over points to sample
+        self.learn_cdf = True
+        self.cdf_params = nn.Sequential(
+            nn.Linear(self.x_size + self.d_size, hidden_size), nn.ReLU(),
+            nn.Linear(hidden_size,
+                      hidden_size), nn.ReLU(), nn.Linear(hidden_size, 2))
+
     def forward(self, x, d):
         """Perform a forward pass on a Neural Radiance Field given a position
         and viewing direction, and predict both the density of the position
@@ -384,16 +424,12 @@ class NeRF(nn.Module):
         """
 
         # embed the position in a high dimensional positional encoding
-        x_shape = list(x.shape)
-        x_shape[-1] *= self.x_positional_encoding_size
         x_embed = self.positional_encoding(
-            x, self.x_positional_encoding_size).reshape(*x_shape)
+            x / self.normalize_position, self.x_positional_encoding_size)
 
         # embed the direction in a high dimensional positional encoding
-        d_shape = list(d.shape)
-        d_shape[-1] *= self.d_positional_encoding_size
-        d_embed = self.positional_encoding(
-            d, self.d_positional_encoding_size).reshape(*d_shape)
+        d_embed = self.positional_encoding(d / torch.linalg.norm(
+            d, dim=-1, keepdim=True), self.d_positional_encoding_size)
 
         # perform a forward pass on several fully connected layers
         block_0 = self.block_0(x_embed)
@@ -404,7 +440,7 @@ class NeRF(nn.Module):
         return self.density(block_1), self.color(block_2)
 
     def render_rays(self, rays_o, rays_d, near, far, num_samples,
-                    random=False, density_noise_std=0.0, pose_limit=6.0):
+                    random=False, density_noise_std=0.0):
         """Render pixels in the imaging plane for a batch of rays given the
         specified parameters of the near and far clipping planes by alpha
         compositing colors predicted by a neural radiance field
@@ -442,14 +478,12 @@ class NeRF(nn.Module):
 
         # normalize the viewing direction of the camera and add
         # an additional dimension of ray samples
-        rays_d = rays_d / torch.linalg.norm(rays_d,
-                                            dim=-1, keepdim=True)
         rays_d = torch.broadcast_to(rays_d.unsqueeze(-2),
                                     [points.shape[0], num_samples, 3])
 
         # predict a density and color for every point along each ray
         # potentially add random noise to each density prediction
-        density, color = self.forward(points / pose_limit, rays_d)
+        density, color = self.forward(points, rays_d)
         density += torch.randn(density.shape,
                                **kwargs) * density_noise_std
 
@@ -460,7 +494,7 @@ class NeRF(nn.Module):
 
     def render_image(self, pose, image_h, image_w, focal_length,
                      near, far, num_samples, max_chunk_size=1024,
-                     random=False, density_noise_std=0.0, pose_limit=6.0):
+                     random=False, density_noise_std=0.0):
         """Render an image with the specified height and width using a camera
         with the specified pose and focal length using a neural radiance
         field evaluated densely at points along rays through the scene
@@ -525,8 +559,8 @@ class NeRF(nn.Module):
             # an inner function that wraps the volume rendering process for
             # each pixel, and then append pixels to an image buffer
             image.append(self.render_rays(
-                rays_o_i, rays_d_i, near, far, num_samples, random=random,
-                pose_limit=pose_limit, density_noise_std=density_noise_std))
+                rays_o_i, rays_d_i, near, far, num_samples,
+                random=random, density_noise_std=density_noise_std))
 
         # merge the sharded predictions into a single image and
         # inflate the tensor to have the correct shape
