@@ -132,7 +132,7 @@ Credit for the idea of NeRF goes to the original authors in their 2020 paper.
 }
 ```
 
-However, if you find this package, please consider citing it!
+However, if you find this package helpful, please consider citing it!
 
 ```
 @misc{trabucco2021nerf,
