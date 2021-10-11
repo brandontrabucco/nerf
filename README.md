@@ -40,7 +40,7 @@ num_samples_per_ray = 64
 max_chunk_size = 1024
 
 # whether to sample points randomly
-random = True
+randomly_sample = True
 
 # standard deviation of gaussian noise added to density head
 density_noise_std = 1.0
@@ -57,7 +57,7 @@ with torch.no_grad():
         far, 
         num_samples_per_ray, 
         max_chunk_size=max_chunk_size,
-        random=random, 
+        randomly_sample=randomly_sample, 
         density_noise_std=density_noise_std)
         
 ```
@@ -85,7 +85,7 @@ focal_length = 130.0
 num_samples_per_ray = 64
 
 # whether to sample points randomly
-random = True
+randomly_sample = True
 
 # standard deviation of gaussian noise added to density head
 density_noise_std = 1.0
@@ -103,7 +103,7 @@ for target, rays_o, rays_d in data_loader:
         near, 
         far, 
         num_samples_per_ray, 
-        random=random, 
+        randomly_sample=randomly_sample, 
         density_noise_std=density_noise_std)
 
     # mean squared error in pixels
