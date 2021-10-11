@@ -6,7 +6,7 @@ This repository implements a minimal training and inference package around Neura
 
 ## Installation
 
-The package may be installed via pip:
+The package may be installed via pip from my PyPI package:
 
 ```bash
 pip install nerf-pytorch
@@ -64,7 +64,7 @@ with torch.no_grad():
 
 ## Training
 
-In addition to rendering, this package provides several helpful utilities for training a NeRF model with supervised learning given image pose pairs. You can build a dataset for training a NeRF model using the provided PixelRayDataset class.
+This package provides several helpful utilities for training a NeRF model with supervised learning given image pose pairs. You can build a dataset for training a NeRF model using the provided PixelRayDataset class.
 
 ```python
 from nerf.dataset import PixelRayDataset
