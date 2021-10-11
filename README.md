@@ -6,7 +6,7 @@ This repository implements a minimal training and inference package around Neura
 
 ## Installation
 
-The package may be installed via pip:
+The package may be installed via pip from my PyPI package:
 
 ```bash
 pip install nerf-pytorch
