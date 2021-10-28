@@ -24,7 +24,8 @@ import torch
 model = NeRF(normalize_position=6.0).cuda()
 
 # select a pose for the camera in homogeneous coordinates
-pose = torch.eye(4).unsqueeze(0)
+pose_o = torch.zeros(1, 3).unsqueeze(0)
+pose_d = torch.eye(3).unsqueeze(0)
 
 # settings for the pinhole camera
 image_h = 100
@@ -49,7 +50,8 @@ density_noise_std = 1.0
 with torch.no_grad():
 
     image = model.render_image(
-        pose.cuda(), 
+        pose_o.cuda(), 
+        pose_d.cuda(), 
         image_h, 
         image_w, 
         focal_length, 

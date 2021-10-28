@@ -1,4 +1,5 @@
 import torch.utils.data as data
+import torch
 from nerf.model import NeRF
 
 
@@ -76,15 +77,26 @@ class PixelRayDataset(data.Dataset):
 
         Returns:
 
-        pixels: torch.Tensor
+        sample['pixels']: torch.Tensor
             a tensor that represents a pixel to be rendered for the given
             rays by alpha compositing predicted colors in space
-        rays_o: torch.Tensor
+        sample['rays']: torch.Tensor
+            a tensor that represents the direction of the ray exiting the
+            camera in the camera coordinate system
+
+        sample['rays_o']: torch.Tensor
             a single ray location in world coordinates, represented as a
             3-vector and paired with a single ray direction
-        rays_d: torch.Tensor
+        sample['rays_d']: torch.Tensor
             a single ray direction in world coordinates, represented as a
             3-vector and paired with a single ray location
+
+        sample['pose_o']: torch.Tensor
+            a single camera location in world coordinates, represented as a
+            3-vector and paired with a camera viewing direction
+        sample['pose_d']: torch.Tensor
+            a single camera viewing direction in world coordinates,
+            represented as a 3-vector and paired with a camera location
 
         """
 
@@ -99,10 +111,17 @@ class PixelRayDataset(data.Dataset):
         # select the image id to select pixels from
         image_bi = idx % self.images.shape[0]
 
-        # select a pixel from the image and the pose of the camera
+        # select a pixel from the image and a corresponding ray
         pixel = self.images[image_bi, image_hi, image_wi]
+        ray = self.rays[image_hi, image_wi]
         pose = self.poses[image_bi]
 
-        # transform the ray to world coordinates using the pose
-        return (pixel, *NeRF.rays_to_world_coordinates(
-            self.rays[image_hi, image_wi], pose[:3, 3], pose[:3, :3]))
+        # then transform the given ray to world coordinates
+        pose_o, pose_d = pose[:3, 3], pose[:3, :3]
+        rays_o, rays_d = NeRF.rays_to_world_coordinates(ray, pose_o, pose_d)
+        return dict(image_wi=torch.LongTensor([image_wi]).to(pixel.device),
+                    image_hi=torch.LongTensor([image_hi]).to(pixel.device),
+                    image_bi=torch.LongTensor([image_bi]).to(pixel.device),
+                    pixels=pixel, rays=ray,
+                    pose_o=pose_o, pose_d=rays_d,
+                    rays_o=rays_o, rays_d=rays_d)

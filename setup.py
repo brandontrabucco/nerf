@@ -23,7 +23,7 @@ CLASSIFIERS = [
     'Programming Language :: Python :: 3.7']
 
 
-setup(name='nerf-pytorch', version='1.1', license='MIT',
+setup(name='nerf-pytorch', version='1.2', license='MIT',
       packages=find_packages(include=['nerf', 'nerf.*']),
       description='Neural Radiance Fields',
       long_description=LONG_DESCRIPTION, classifiers=CLASSIFIERS,
@@ -32,4 +32,4 @@ setup(name='nerf-pytorch', version='1.1', license='MIT',
       author='Brandon Trabucco', author_email='brandon@btrabucco.com',
       url='https://github.com/brandontrabucco/nerf',
       download_url='https://github.com/brandontrabucco'
-                   '/nerf/archive/v1_1.tar.gz')
+                   '/nerf/archive/v1_2.tar.gz')

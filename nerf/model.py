@@ -133,22 +133,33 @@ class NeRF(nn.Module):
         # with the a shape that can be broadcast to camera_d.shape
         kwargs = dict(dtype=camera_d.dtype, device=camera_d.device)
         broadcast_shape = [1 for _ in range(len(camera_d.shape[:-1]))]
-        default_camera = torch.Tensor([0, 0, -1], **kwargs)
+        default_camera = torch.Tensor([0, 0, -1]).to(**kwargs)
         default_camera = default_camera.reshape(*(broadcast_shape + [3]))
+        default_camera = torch.broadcast_to(default_camera, camera_d.shape)
 
         # calculate the axis of rotation k and angle of rotation a
         # from the default camera to world coordinates
-        rotation_k = torch.cross(default_camera, camera_d, dim=-1)
         cos_a = functional.cosine_similarity(default_camera, camera_d, dim=-1)
+        rotation_k = torch.cross(default_camera, camera_d, dim=-1)
+        rotation_k_norm = torch.linalg.norm(rotation_k, dim=-1, keepdim=True)
+
+        # normalize the axis of rotation to unit norm and handle when the
+        # viewing direction is parallel to the primal camera axis
+        fallback_k = torch.Tensor([0, -1, 0]).to(**kwargs)
+        fallback_k = fallback_k.reshape(*(broadcast_shape + [3]))
+        fallback_k = torch.broadcast_to(fallback_k, rotation_k.shape)
+        rotation_k = torch.where(torch.eq(rotation_k_norm, 0),
+                                 fallback_k,
+                                 rotation_k / rotation_k_norm)
 
         # broadcast the rotation angles to the correct tensor shape
         cos_a = cos_a.reshape(*(list(cos_a.shape) + [1, 1]))
         sin_a = torch.sqrt(1.0 - cos_a ** 2)
 
         # three matrices to build a 'cross product matrix'
-        a0 = torch.Tensor([[0, 0, 0], [0, 0, -1], [0, 1, 0]], **kwargs)
-        a1 = torch.Tensor([[0, 0, 1], [0, 0, 0], [-1, 0, 0]], **kwargs)
-        a2 = torch.Tensor([[0, -1, 0], [1, 0, 0], [0, 0, 0]], **kwargs)
+        a0 = torch.Tensor([[0, 0, 0], [0, 0, -1], [0, 1, 0]]).to(**kwargs)
+        a1 = torch.Tensor([[0, 0, 1], [0, 0, 0], [-1, 0, 0]]).to(**kwargs)
+        a2 = torch.Tensor([[0, -1, 0], [1, 0, 0], [0, 0, 0]]).to(**kwargs)
 
         # a matrix that represents a cross product with k
         rotation_k = torch.stack([torch.matmul(rotation_k, a0),
@@ -257,30 +268,8 @@ class NeRF(nn.Module):
 
         if self.learn_cdf_for_volume_sampling:
 
-            # embed the position in a high dimensional positional encoding
-            x_embed = self.positional_encoding(
-                rays_o / self.normalize_position,
-                self.x_positional_encoding_size)
-
-            # embed the direction in a high dimensional positional encoding
-            d_embed = self.positional_encoding(
-                rays_d / torch.linalg.norm(rays_d, dim=-1, keepdim=True),
-                self.d_positional_encoding_size)
-
-            # perform a forward pass on several fully connected layers
-            params = self.cdf_params(torch.cat([x_embed, d_embed], dim=-1))
-
-            # final activation functions to output cdf parameters
-            a = torch.exp(params[..., 0:1])
-            b = torch.sigmoid(params[..., 1:2])
-
-            # values for scaling the cdf between 0 and 1
-            z0 = torch.sigmoid(-a * b)
-            z1 = torch.sigmoid(a * (1.0 - b))
-
             # pass samples through an inverse cdf transform
-            samples = torch.logit((z1 - z0) *
-                                  samples + z0, eps=1e-6) / a + b
+            samples = self.inverse_transform(rays_o, rays_d, samples)
 
         # scale samples between near and far clipping bounds
         samples = near + samples * (far - near)
@@ -365,6 +354,7 @@ class NeRF(nn.Module):
         self.density_outputs = 1
         self.color_outputs = color_outputs
         self.normalize_position = normalize_position
+        self.learn_cdf_for_volume_sampling = learn_cdf_for_volume_sampling
 
         # record the size of inputs to the network and
         # corresponding positional encodings
@@ -382,37 +372,103 @@ class NeRF(nn.Module):
 
         # a neural network block that processes position
         self.block_0 = nn.Sequential(
-            nn.Linear(self.x_size, hidden_size), nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size), nn.ReLU())
+            nn.Linear(self.x_size, hidden_size),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_size))
 
         # a neural network block with a skip connection
         self.block_1 = nn.Sequential(
-            nn.Linear(self.x_size + hidden_size, hidden_size), nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size), nn.ReLU())
+            nn.Linear(self.x_size + hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_size))
 
         # a neural network block that processes direction
         self.block_2 = nn.Sequential(
-            nn.Linear(self.d_size + hidden_size, hidden_size), nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size), nn.ReLU())
+            nn.Linear(self.d_size + hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_size))
 
         # layers for parameterizing the cdf over points to sample
-        self.learn_cdf_for_volume_sampling = learn_cdf_for_volume_sampling
-        self.cdf_params = nn.Sequential(
-            nn.Linear(self.x_size + self.d_size, hidden_size), nn.ReLU(),
-            nn.Linear(hidden_size,
-                      hidden_size), nn.ReLU(), nn.Linear(hidden_size, 2))
+        if learn_cdf_for_volume_sampling:
+            self.cdf_params = nn.Sequential(
+                nn.Linear(self.x_size + self.d_size, hidden_size),
+                nn.ReLU(),
+                nn.LayerNorm(hidden_size),
+                nn.Linear(hidden_size, hidden_size),
+                nn.ReLU(),
+                nn.LayerNorm(hidden_size),
+                nn.Linear(hidden_size, 2))
 
-    def forward(self, ray_x, ray_d):
+    def inverse_transform(self, rays_o, rays_d, samples):
         """Perform a forward pass on a Neural Radiance Field given a position
         and viewing direction, and predict both the density of the position
         and the color of the position and viewing direction
 
         Arguments:
 
-        ray_x: torch.Tensor
+        rays_o: torch.Tensor
             an input vector that represents the positions in 3D space the
             NeRF model is evaluated at, using a positional encoding
-        ray_d: torch.Tensor
+        rays_d: torch.Tensor
+            an input vector that represents the viewing direction the NeRF
+            model is evaluated at, using a positional encoding
+        samples: torch.Tensor
+            points sampled along each ray between the near and far clipping
+            planes normalized between zero and one
+
+        Returns:
+
+        density: torch.Tensor
+            an positive floating point tensor representing the density of the
+            shape at the current location in space independent to view
+        shape: torch.Tensor
+            an positive floating point tensor on [0, 1] representing the color
+            of at the current location in space dependent on view direction
+
+        """
+
+        # embed the position in a high dimensional positional encoding
+        x_embed = self.positional_encoding(
+            rays_o / self.normalize_position, self.x_positional_encoding_size)
+
+        # embed the direction in a high dimensional positional encoding
+        d_embed = self.positional_encoding(rays_d / torch.linalg.norm(
+            rays_d, dim=-1, keepdim=True), self.d_positional_encoding_size)
+
+        # perform a forward pass on several fully connected layers
+        params = self.cdf_params(torch.cat([x_embed, d_embed], dim=-1))
+
+        # final activation functions to output cdf parameters
+        a = torch.exp(params[..., 0:1])
+        b = torch.sigmoid(params[..., 1:2])
+
+        # values for scaling the cdf between 0 and 1
+        z0 = torch.sigmoid(-a * b)
+        z1 = torch.sigmoid(a * (1.0 - b))
+
+        # pass samples through an inverse cdf transform
+        return torch.logit((z1 - z0) * samples + z0, eps=1e-6) / a + b
+
+    def forward(self, rays_x, rays_d):
+        """Perform a forward pass on a Neural Radiance Field given a position
+        and viewing direction, and predict both the density of the position
+        and the color of the position and viewing direction
+
+        Arguments:
+
+        rays_x: torch.Tensor
+            an input vector that represents the positions in 3D space the
+            NeRF model is evaluated at, using a positional encoding
+        rays_d: torch.Tensor
             an input vector that represents the viewing direction the NeRF
             model is evaluated at, using a positional encoding
 
@@ -429,11 +485,11 @@ class NeRF(nn.Module):
 
         # embed the position in a high dimensional positional encoding
         x_embed = self.positional_encoding(
-            ray_x / self.normalize_position, self.x_positional_encoding_size)
+            rays_x / self.normalize_position, self.x_positional_encoding_size)
 
         # embed the direction in a high dimensional positional encoding
-        d_embed = self.positional_encoding(ray_d / torch.linalg.norm(
-            ray_d, dim=-1, keepdim=True), self.d_positional_encoding_size)
+        d_embed = self.positional_encoding(rays_d / torch.linalg.norm(
+            rays_d, dim=-1, keepdim=True), self.d_positional_encoding_size)
 
         # perform a forward pass on several fully connected layers
         block_0 = self.block_0(x_embed)
@@ -503,7 +559,7 @@ class NeRF(nn.Module):
         weights = self.alpha_compositing_coefficients(points, density)
         return (torch.sigmoid(color) * weights).sum(dim=-2)
 
-    def render_image(self, pose, image_h, image_w, focal_length,
+    def render_image(self, camera_o, camera_r, image_h, image_w, focal_length,
                      near, far, num_samples, max_chunk_size=1024,
                      randomly_sample=False, density_noise_std=0.0):
         """Render an image with the specified height and width using a camera
@@ -512,9 +568,12 @@ class NeRF(nn.Module):
 
         Arguments:
 
-        pose: torch.Tensor
-            a batch of camera poses represented as a 4x4 matrix in homogeneous
-            coordinates containing the camera position and rotation
+        camera_o: torch.Tensor
+            a batch of camera locations in world coordinates, represented
+            as 3-vectors paired with every ray in the tensor rays
+        camera_r: torch.Tensor
+            a batch of camera rotations in world coordinates, represented
+            as a rotation matrix in SO(3) found by Rodrigues' formula
         image_h: int
             an integer that described the height of the imaging plane in
             pixels and determines the number of rays sampled vertically
@@ -552,19 +611,25 @@ class NeRF(nn.Module):
         """
 
         # generate all possible rays to cast through the scene
-        kwargs = dict(dtype=pose.dtype, device=pose.device)
+        kwargs = dict(dtype=camera_o.dtype, device=camera_o.device)
+        batch_size = camera_o.shape[0]
         rays = self.generate_rays(image_h, image_w, focal_length, **kwargs)
 
         # ensure the rays and pose have compatible shape, by adding a
         # batch size dimension to the rays tensor and spatial size to pose
-        rays = torch.broadcast_to(rays.unsqueeze(0),
-                                  [pose.shape[0], image_h, image_w, 3])
-        pose = torch.broadcast_to(pose.unsqueeze(1).unsqueeze(1),
-                                  [pose.shape[0], image_h, image_w, 4, 4])
+        rays = torch.broadcast_to(
+            rays.unsqueeze(0), [batch_size, image_h, image_w, 3])
+
+        # broadcast the camera pose to have a spatial size equal to the
+        # number of pixels being rendered in the image
+        camera_o = torch.broadcast_to(camera_o.unsqueeze(
+            1).unsqueeze(1), [batch_size, image_h, image_w, 3])
+        camera_r = torch.broadcast_to(camera_r.unsqueeze(
+            1).unsqueeze(1), [batch_size, image_h, image_w, 3, 3])
 
         # transform the rays to the world coordinate system using pose
-        rays_o, rays_d = self.rays_to_world_coordinates(
-            rays, pose[..., :3, 3], pose[..., :3, :3])
+        rays_o, rays_d = self.rays_to_world_coordinates(rays,
+                                                        camera_o, camera_r)
 
         # flatten the batch size with the spatial size for batching
         rays_o = torch.flatten(rays_o, start_dim=0, end_dim=2)
@@ -585,5 +650,5 @@ class NeRF(nn.Module):
 
         # merge the sharded predictions into a single image and
         # inflate the tensor to have the correct shape
-        return torch.cat(image, dim=0).reshape(pose.shape[0],
+        return torch.cat(image, dim=0).reshape(batch_size,
                                                image_h, image_w, 3)
