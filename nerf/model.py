@@ -137,24 +137,24 @@ class NeRF(nn.Module):
         default_camera = default_camera.reshape(*(broadcast_shape + [3]))
         default_camera = torch.broadcast_to(default_camera, camera_d.shape)
 
-        # calculate the axis of rotation k and angle of rotation a
-        # from the default camera to world coordinates
-        cos_a = functional.cosine_similarity(default_camera, camera_d, dim=-1)
-        rotation_k = torch.cross(default_camera, camera_d, dim=-1)
-        rotation_k_norm = torch.linalg.norm(rotation_k, dim=-1, keepdim=True)
+        # normalize the camera viewing direction to unit norm and calculate
+        # the axis of rotation by taking a cross product
+        unit_d = camera_d / torch.linalg.norm(camera_d, dim=-1, keepdim=True)
+        rotation_k = torch.cross(default_camera, unit_d, dim=-1)
+
+        # calculate the cosine and sine of the angle between the vectors
+        # using two identities from linear algebra
+        cos_a = (default_camera * unit_d).sum(dim=-1, keepdim=True)
+        sin_a = torch.linalg.norm(rotation_k, dim=-1, keepdim=True)
 
         # normalize the axis of rotation to unit norm and handle when the
         # viewing direction is parallel to the primal camera axis
         fallback_k = torch.Tensor([0, -1, 0]).to(**kwargs)
         fallback_k = fallback_k.reshape(*(broadcast_shape + [3]))
         fallback_k = torch.broadcast_to(fallback_k, rotation_k.shape)
-        rotation_k = torch.where(torch.eq(rotation_k_norm, 0),
+        rotation_k = torch.where(torch.eq(sin_a, 0),
                                  fallback_k,
-                                 rotation_k / rotation_k_norm)
-
-        # broadcast the rotation angles to the correct tensor shape
-        cos_a = cos_a.reshape(*(list(cos_a.shape) + [1, 1]))
-        sin_a = torch.sqrt(1.0 - cos_a ** 2)
+                                 rotation_k / sin_a).detach()
 
         # three matrices to build a 'cross product matrix'
         a0 = torch.Tensor([[0, 0, 0], [0, 0, -1], [0, 1, 0]]).to(**kwargs)
@@ -167,8 +167,10 @@ class NeRF(nn.Module):
                                   torch.matmul(rotation_k, a2)], dim=-1)
 
         # build an identity matrix of the same shape as rotation_k
+        # and broadcast the rotation angles to the correct tensor shape
         eye_k = torch.eye(3, **kwargs)
         eye_k = eye_k.reshape(*(broadcast_shape + [3, 3]))
+        cos_a, sin_a = cos_a.unsqueeze(-1), sin_a.unsqueeze(-1)
 
         # build a rotation matrix using Rodrigues' rotation formula
         return (eye_k + rotation_k * sin_a +
@@ -313,9 +315,9 @@ class NeRF(nn.Module):
             alpha[..., :-1, :] + 1e-10, dim=-2), (0, 0, 1, 0), value=1.0)
 
     def __init__(self, density_inputs=3, color_inputs=3, color_outputs=3,
-                 hidden_size=128, x_positional_encoding_size=20,
+                 hidden_size=256, x_positional_encoding_size=20,
                  d_positional_encoding_size=12, normalize_position=1.0,
-                 learn_cdf_for_volume_sampling=True):
+                 learn_cdf_for_volume_sampling=False):
         """Create a neural network model that learns a Neural Radiance Field
         by mapping positions and camera orientations in 3D space into the
         RBG and density values of a Neural Radiance Field (NeRF)
@@ -360,9 +362,9 @@ class NeRF(nn.Module):
         # corresponding positional encodings
         self.d_positional_encoding_size = d_positional_encoding_size
         self.x_positional_encoding_size = x_positional_encoding_size
-        self.d_size = (self.density_inputs *
+        self.d_size = (self.color_inputs *
                        self.d_positional_encoding_size)
-        self.x_size = (self.color_inputs *
+        self.x_size = (self.density_inputs *
                        self.x_positional_encoding_size)
 
         # a final fully connected layer that outputs opacity
@@ -377,11 +379,23 @@ class NeRF(nn.Module):
             nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
             nn.LayerNorm(hidden_size))
 
         # a neural network block with a skip connection
         self.block_1 = nn.Sequential(
             nn.Linear(self.x_size + hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
             nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, hidden_size),
@@ -458,7 +472,7 @@ class NeRF(nn.Module):
         # pass samples through an inverse cdf transform
         return torch.logit((z1 - z0) * samples + z0, eps=1e-6) / a + b
 
-    def forward(self, rays_x, rays_d):
+    def forward(self, rays_x, rays_d, states):
         """Perform a forward pass on a Neural Radiance Field given a position
         and viewing direction, and predict both the density of the position
         and the color of the position and viewing direction
@@ -471,6 +485,9 @@ class NeRF(nn.Module):
         rays_d: torch.Tensor
             an input vector that represents the viewing direction the NeRF
             model is evaluated at, using a positional encoding
+        states: torch.Tensor
+            a batch of input vectors that represent the visual state of
+            objects in the scene, which affects their geometry
 
         Returns:
 
@@ -487,6 +504,10 @@ class NeRF(nn.Module):
         x_embed = self.positional_encoding(
             rays_x / self.normalize_position, self.x_positional_encoding_size)
 
+        # concatenate an additional state vector to the density inputs
+        x_embed = torch.cat([self.positional_encoding(
+            states, self.x_positional_encoding_size), x_embed], dim=-1)
+
         # embed the direction in a high dimensional positional encoding
         d_embed = self.positional_encoding(rays_d / torch.linalg.norm(
             rays_d, dim=-1, keepdim=True), self.d_positional_encoding_size)
@@ -499,7 +520,8 @@ class NeRF(nn.Module):
         # final activation functions to output density and color
         return self.density(block_1), self.color(block_2)
 
-    def render_rays(self, rays_o, rays_d, near, far, num_samples,
+    def render_rays(self, rays_o, rays_d, states,
+                    near, far, num_samples,
                     randomly_sample=False, density_noise_std=0.0):
         """Render pixels in the imaging plane for a batch of rays given the
         specified parameters of the near and far clipping planes by alpha
@@ -513,6 +535,9 @@ class NeRF(nn.Module):
         rays_d: torch.Tensor
             a batch of ray directions in world coordinates, represented
             as 3-vectors and paired with a batch of ray locations
+        states: torch.Tensor
+            a batch of input vectors that represent the visual state of
+            objects in the scene, which affects their geometry
         near: float
             the distance in world coordinates of the near plane from the
             camera origin along the ray defined by rays_d
@@ -547,10 +572,12 @@ class NeRF(nn.Module):
         # an additional dimension of ray samples
         rays_d = torch.broadcast_to(rays_d.unsqueeze(-2),
                                     [points.shape[0], num_samples, 3])
+        states = torch.broadcast_to(states.unsqueeze(-2), [
+            points.shape[0], num_samples, states.shape[-1]])
 
         # predict a density and color for every point along each ray
         # potentially add random noise to each density prediction
-        density, color = self.forward(points, rays_d)
+        density, color = self.forward(points, rays_d, states)
         density += torch.randn(density.shape,
                                **kwargs) * density_noise_std
 
@@ -559,8 +586,9 @@ class NeRF(nn.Module):
         weights = self.alpha_compositing_coefficients(points, density)
         return (torch.sigmoid(color) * weights).sum(dim=-2)
 
-    def render_image(self, camera_o, camera_r, image_h, image_w, focal_length,
-                     near, far, num_samples, max_chunk_size=1024,
+    def render_image(self, camera_o, camera_r, states,
+                     image_h, image_w, focal_length, near, far, num_samples,
+                     max_chunk_size=1024,
                      randomly_sample=False, density_noise_std=0.0):
         """Render an image with the specified height and width using a camera
         with the specified pose and focal length using a neural radiance
@@ -574,6 +602,9 @@ class NeRF(nn.Module):
         camera_r: torch.Tensor
             a batch of camera rotations in world coordinates, represented
             as a rotation matrix in SO(3) found by Rodrigues' formula
+        states: torch.Tensor
+            a batch of input vectors that represent the visual state of
+            objects in the scene, which affects their geometry
         image_h: int
             an integer that described the height of the imaging plane in
             pixels and determines the number of rays sampled vertically
@@ -626,6 +657,9 @@ class NeRF(nn.Module):
             1).unsqueeze(1), [batch_size, image_h, image_w, 3])
         camera_r = torch.broadcast_to(camera_r.unsqueeze(
             1).unsqueeze(1), [batch_size, image_h, image_w, 3, 3])
+        states = torch.broadcast_to(states.unsqueeze(1).unsqueeze(1),
+                                    [batch_size, image_h,
+                                     image_w, states.shape[-1]])
 
         # transform the rays to the world coordinate system using pose
         rays_o, rays_d = self.rays_to_world_coordinates(rays,
@@ -634,17 +668,20 @@ class NeRF(nn.Module):
         # flatten the batch size with the spatial size for batching
         rays_o = torch.flatten(rays_o, start_dim=0, end_dim=2)
         rays_d = torch.flatten(rays_d, start_dim=0, end_dim=2)
+        states = torch.flatten(states, start_dim=0, end_dim=2)
 
         # shard the rendering process in case the image is too large
         # or we are generating many samples along each ray
         image = []
-        for rays_o_i, rays_d_i in zip(torch.split(rays_o, max_chunk_size),
-                                      torch.split(rays_d, max_chunk_size)):
+        for rays_o_i, rays_d_i, states_i in zip(
+                torch.split(rays_o, max_chunk_size),
+                torch.split(rays_d, max_chunk_size),
+                torch.split(states, max_chunk_size)):
 
             # an inner function that wraps the volume rendering process for
             # each pixel, and then append pixels to an image buffer
             image.append(self.render_rays(
-                rays_o_i, rays_d_i, near, far, num_samples,
+                rays_o_i, rays_d_i, states_i, near, far, num_samples,
                 randomly_sample=randomly_sample,
                 density_noise_std=density_noise_std))
 
