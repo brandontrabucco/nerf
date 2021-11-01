@@ -191,7 +191,8 @@ class PixelRayDataset(data.Dataset):
 
     """
 
-    def __init__(self, images, poses, states, focal_length):
+    def __init__(self, images, poses, focal_length,
+                 x_states=None, d_states=None):
         """Generate a dataset containing rays from a pinhole camera with the
         specified focal length with an imaging plane of size equal to the
         height and width of the provided images tensor
@@ -204,18 +205,22 @@ class PixelRayDataset(data.Dataset):
         poses: torch.Tensor
             a torch tensor containing poses of a camera represented by a
             transformation in homogeneous coordinates: [batch, 4, 4]
-        states: torch.Tensor
-            a batch of input vectors that represent the visual state of
-            objects in the scene, which affects their geometry
         focal_length: float
             a float representing the focal length of a pinhole camera and
             used to scale the physical size of the imaging plane
+        states_x: torch.Tensor
+            a batch of input vectors that represent the visual state of
+            objects in the scene, which affects density and color
+        states_d: torch.Tensor
+            a batch of input vectors that represent the visual state of
+            objects in the scene, which affects only the color
 
         """
 
         self.images = images
         self.poses = poses
-        self.states = states
+        self.x_states = x_states
+        self.d_states = d_states
 
         # generate all possible rays to cast through the scene
         kwargs = dict(dtype=images.dtype, device=images.device)
@@ -288,7 +293,14 @@ class PixelRayDataset(data.Dataset):
         pixel = self.images[image_bi, image_hi, image_wi]
         ray = self.rays[image_hi, image_wi]
         pose = self.poses[image_bi]
-        state = self.states[image_bi]
+
+        # select the state if provided in the original dataset
+        x_state = (self.x_states[image_bi]
+                   if self.x_states is not None
+                   else torch.zeros(0, device=pixel.device))
+        d_state = (self.d_states[image_bi]
+                   if self.d_states is not None
+                   else torch.zeros(0, device=pixel.device))
 
         # then transform the given ray to world coordinates
         pose_o, pose_d = pose[:3, 3], pose[:3, :3]
@@ -296,6 +308,7 @@ class PixelRayDataset(data.Dataset):
         return dict(image_wi=torch.LongTensor([image_wi]).to(pixel.device),
                     image_hi=torch.LongTensor([image_hi]).to(pixel.device),
                     image_bi=torch.LongTensor([image_bi]).to(pixel.device),
-                    pixels=pixel, states=state, rays=ray,
+                    x_states=x_state, d_states=d_state,
+                    pixels=pixel, rays=ray,
                     pose_o=pose_o, pose_d=rays_d,
                     rays_o=rays_o, rays_d=rays_d)

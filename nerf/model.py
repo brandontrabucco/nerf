@@ -472,7 +472,7 @@ class NeRF(nn.Module):
         # pass samples through an inverse cdf transform
         return torch.logit((z1 - z0) * samples + z0, eps=1e-6) / a + b
 
-    def forward(self, rays_x, rays_d, states):
+    def forward(self, rays_x, rays_d, states_x=None, states_d=None):
         """Perform a forward pass on a Neural Radiance Field given a position
         and viewing direction, and predict both the density of the position
         and the color of the position and viewing direction
@@ -485,9 +485,12 @@ class NeRF(nn.Module):
         rays_d: torch.Tensor
             an input vector that represents the viewing direction the NeRF
             model is evaluated at, using a positional encoding
-        states: torch.Tensor
+        states_x: torch.Tensor
             a batch of input vectors that represent the visual state of
-            objects in the scene, which affects their geometry
+            objects in the scene, which affects density and color
+        states_d: torch.Tensor
+            a batch of input vectors that represent the visual state of
+            objects in the scene, which affects only the color
 
         Returns:
 
@@ -504,13 +507,19 @@ class NeRF(nn.Module):
         x_embed = self.positional_encoding(
             rays_x / self.normalize_position, self.x_positional_encoding_size)
 
-        # concatenate an additional state vector to the density inputs
-        x_embed = torch.cat([self.positional_encoding(
-            states, self.x_positional_encoding_size), x_embed], dim=-1)
-
         # embed the direction in a high dimensional positional encoding
         d_embed = self.positional_encoding(rays_d / torch.linalg.norm(
             rays_d, dim=-1, keepdim=True), self.d_positional_encoding_size)
+
+        # concatenate an additional state vector to the density inputs
+        if states_x is not None:
+            x_embed = torch.cat([self.positional_encoding(
+                states_x, self.x_positional_encoding_size), x_embed], dim=-1)
+
+        # concatenate an additional state vector to the density inputs
+        if states_d is not None:
+            d_embed = torch.cat([self.positional_encoding(
+                states_d, self.d_positional_encoding_size), d_embed], dim=-1)
 
         # perform a forward pass on several fully connected layers
         block_0 = self.block_0(x_embed)
@@ -520,8 +529,8 @@ class NeRF(nn.Module):
         # final activation functions to output density and color
         return self.density(block_1), self.color(block_2)
 
-    def render_rays(self, rays_o, rays_d, states,
-                    near, far, num_samples,
+    def render_rays(self, rays_o, rays_d, near, far, num_samples,
+                    states_x=None, states_d=None,
                     randomly_sample=False, density_noise_std=0.0):
         """Render pixels in the imaging plane for a batch of rays given the
         specified parameters of the near and far clipping planes by alpha
@@ -535,9 +544,6 @@ class NeRF(nn.Module):
         rays_d: torch.Tensor
             a batch of ray directions in world coordinates, represented
             as 3-vectors and paired with a batch of ray locations
-        states: torch.Tensor
-            a batch of input vectors that represent the visual state of
-            objects in the scene, which affects their geometry
         near: float
             the distance in world coordinates of the near plane from the
             camera origin along the ray defined by rays_d
@@ -547,6 +553,12 @@ class NeRF(nn.Module):
         num_samples: int
             the number of samples along each ray to generate by sampling
             uniformly from num_samples bins between clipping planes
+        states_x: torch.Tensor
+            a batch of input vectors that represent the visual state of
+            objects in the scene, which affects density and color
+        states_d: torch.Tensor
+            a batch of input vectors that represent the visual state of
+            objects in the scene, which affects only the color
         randomly_sample: bool
             whether to randomly sample the evaluation positions along each
             ray or to use a deterministic set of points
@@ -572,12 +584,17 @@ class NeRF(nn.Module):
         # an additional dimension of ray samples
         rays_d = torch.broadcast_to(rays_d.unsqueeze(-2),
                                     [points.shape[0], num_samples, 3])
-        states = torch.broadcast_to(states.unsqueeze(-2), [
-            points.shape[0], num_samples, states.shape[-1]])
+        if states_x is not None:
+            states_x = torch.broadcast_to(states_x.unsqueeze(
+                -2), [points.shape[0], num_samples, states_x.shape[-1]])
+        if states_d is not None:
+            states_d = torch.broadcast_to(states_d.unsqueeze(
+                -2), [points.shape[0], num_samples, states_d.shape[-1]])
 
         # predict a density and color for every point along each ray
         # potentially add random noise to each density prediction
-        density, color = self.forward(points, rays_d, states)
+        density, color = self.forward(points, rays_d, states_x=states_x,
+                                      states_d=states_d)
         density += torch.randn(density.shape,
                                **kwargs) * density_noise_std
 
@@ -586,8 +603,8 @@ class NeRF(nn.Module):
         weights = self.alpha_compositing_coefficients(points, density)
         return (torch.sigmoid(color) * weights).sum(dim=-2)
 
-    def render_image(self, camera_o, camera_r, states,
-                     image_h, image_w, focal_length, near, far, num_samples,
+    def render_image(self, camera_o, camera_r, image_h, image_w, focal_length,
+                     near, far, num_samples, states_x=None, states_d=None,
                      max_chunk_size=1024,
                      randomly_sample=False, density_noise_std=0.0):
         """Render an image with the specified height and width using a camera
@@ -602,9 +619,6 @@ class NeRF(nn.Module):
         camera_r: torch.Tensor
             a batch of camera rotations in world coordinates, represented
             as a rotation matrix in SO(3) found by Rodrigues' formula
-        states: torch.Tensor
-            a batch of input vectors that represent the visual state of
-            objects in the scene, which affects their geometry
         image_h: int
             an integer that described the height of the imaging plane in
             pixels and determines the number of rays sampled vertically
@@ -623,6 +637,12 @@ class NeRF(nn.Module):
         num_samples: int
             the number of samples along each ray to generate by sampling
             uniformly from num_samples bins between clipping planes
+        states_x: torch.Tensor
+            a batch of input vectors that represent the visual state of
+            objects in the scene, which affects density and color
+        states_d: torch.Tensor
+            a batch of input vectors that represent the visual state of
+            objects in the scene, which affects only the color
         max_chunk_size: int
             the maximum number of elements in a single batch chunk to process
             in parallel, in order to save memory for large images
@@ -657,33 +677,47 @@ class NeRF(nn.Module):
             1).unsqueeze(1), [batch_size, image_h, image_w, 3])
         camera_r = torch.broadcast_to(camera_r.unsqueeze(
             1).unsqueeze(1), [batch_size, image_h, image_w, 3, 3])
-        states = torch.broadcast_to(states.unsqueeze(1).unsqueeze(1),
-                                    [batch_size, image_h,
-                                     image_w, states.shape[-1]])
+
+        # broadcast the states of the radiance field to the correct shape
+        # accounting for the number of raysd being cast
+        if states_x is not None:
+            states_x = torch.broadcast_to(states_x.unsqueeze(
+                1).unsqueeze(1), [batch_size, image_h,
+                                  image_w, states_x.shape[-1]])
+        if states_d is not None:
+            states_d = torch.broadcast_to(states_d.unsqueeze(
+                1).unsqueeze(1), [batch_size, image_h,
+                                  image_w, states_d.shape[-1]])
 
         # transform the rays to the world coordinate system using pose
-        rays_o, rays_d = self.rays_to_world_coordinates(rays,
-                                                        camera_o, camera_r)
-
-        # flatten the batch size with the spatial size for batching
-        rays_o = torch.flatten(rays_o, start_dim=0, end_dim=2)
-        rays_d = torch.flatten(rays_d, start_dim=0, end_dim=2)
-        states = torch.flatten(states, start_dim=0, end_dim=2)
+        rays_o, rays_d = self\
+            .rays_to_world_coordinates(rays, camera_o, camera_r)
 
         # shard the rendering process in case the image is too large
         # or we are generating many samples along each ray
-        image = []
-        for rays_o_i, rays_d_i, states_i in zip(
-                torch.split(rays_o, max_chunk_size),
-                torch.split(rays_d, max_chunk_size),
-                torch.split(states, max_chunk_size)):
+        rays_o = torch.flatten(rays_o, start_dim=0, end_dim=2)
+        rays_d = torch.flatten(rays_d, start_dim=0, end_dim=2)
+        batched_inputs = [torch.split(rays_o, max_chunk_size),
+                          torch.split(rays_d, max_chunk_size)]
 
-            # an inner function that wraps the volume rendering process for
-            # each pixel, and then append pixels to an image buffer
-            image.append(self.render_rays(
-                rays_o_i, rays_d_i, states_i, near, far, num_samples,
-                randomly_sample=randomly_sample,
-                density_noise_std=density_noise_std))
+        # if visual states are provided that also create shards for
+        # these tensors and add them to the batch
+        if states_x is not None:
+            batched_inputs.append(torch.split(torch.flatten(
+                states_x, start_dim=0, end_dim=2), max_chunk_size))
+        if states_d is not None:
+            batched_inputs.append(torch.split(torch.flatten(
+                states_d, start_dim=0, end_dim=2), max_chunk_size))
+
+        # an inner function that wraps the volume rendering process for
+        # each pixel, and then append pixels to an image buffer
+        image = [self.render_rays(
+            rays_o_i, rays_d_i, near, far, num_samples,
+            states_x=None if states_x is None else states_i[0],
+            states_d=None if states_d is None else states_i[1],
+            randomly_sample=randomly_sample,
+            density_noise_std=density_noise_std)
+            for rays_o_i, rays_d_i, *states_i in zip(*batched_inputs)]
 
         # merge the sharded predictions into a single image and
         # inflate the tensor to have the correct shape
