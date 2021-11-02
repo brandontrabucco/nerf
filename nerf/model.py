@@ -29,9 +29,9 @@ class NeRF(nn.Module):
     color_outputs: int
         the number of outputs made by the network representing color
         and should typically be set to three
-    learn_cdf_for_volume_sampling: bool
-        whether to use a learned inverse cdf transform for sampling
-        points to evaluate radiance along each ray
+    num_stages: int
+        the number of stages to use when generating an image, where
+        later stages sample along rays using an empirical cdf
 
     """
 
@@ -154,7 +154,7 @@ class NeRF(nn.Module):
         fallback_k = torch.broadcast_to(fallback_k, rotation_k.shape)
         rotation_k = torch.where(torch.eq(sin_a, 0),
                                  fallback_k,
-                                 rotation_k / sin_a).detach()
+                                 rotation_k / sin_a)
 
         # three matrices to build a 'cross product matrix'
         a0 = torch.Tensor([[0, 0, 0], [0, 0, -1], [0, 1, 0]]).to(**kwargs)
@@ -393,8 +393,8 @@ class NeRF(nn.Module):
                 samples_bounds[..., 1] - samples_bounds[..., 0])
 
     def __init__(self, density_inputs=3, color_inputs=3, color_outputs=3,
-                 hidden_size=256, x_positional_encoding_size=20, num_stages=2,
-                 d_positional_encoding_size=12, normalize_position=1.0):
+                 hidden_size=256, x_positional_encoding_size=32, num_stages=2,
+                 d_positional_encoding_size=24, normalize_position=1.0):
         """Create a neural network model that learns a Neural Radiance Field
         by mapping positions and camera orientations in 3D space into the
         RBG and density values of a Neural Radiance Field (NeRF)
@@ -419,9 +419,9 @@ class NeRF(nn.Module):
         color_outputs: int
             the number of outputs made by the network representing color
             and should typically be set to three
-        learn_cdf_for_volume_sampling: bool
-            whether to use a learned inverse cdf transform for sampling
-            points to evaluate radiance along each ray
+        num_stages: int
+            the number of stages to use when generating an image, where
+            later stages sample along rays using an empirical cdf
 
         """
 
@@ -495,7 +495,7 @@ class NeRF(nn.Module):
             nn.LayerNorm(hidden_size))
             for i in range(self.num_stages)])
 
-    def forward(self, rays_x, rays_d, stage=0, states_x=None, states_d=None):
+    def forward(self, rays_x, rays_d, stage, states_x=None, states_d=None):
         """Perform a forward pass on a Neural Radiance Field given a position
         and viewing direction, and predict both the density of the position
         and the color of the position and viewing direction
@@ -508,6 +508,9 @@ class NeRF(nn.Module):
         rays_d: torch.Tensor
             an input vector that represents the viewing direction the NeRF
             model is evaluated at, using a positional encoding
+        stage int
+            the stage of the nerf model to use during thie forward pass
+            where from zero to n the models run course to fine
         states_x: torch.Tensor
             a batch of input vectors that represent the visual state of
             objects in the scene, which affects density and color
@@ -616,7 +619,7 @@ class NeRF(nn.Module):
 
         image_stages = []
 
-        # iterate through every stage from course to fine
+        # iterate through every stage of the nerf model from course to fine
         for stage_idx in range(self.num_stages):
 
             if stage_idx > 0: # only later stages invert the cdf
@@ -626,7 +629,7 @@ class NeRF(nn.Module):
                 new_samples = self.inverse_transform_sampling(
                     0.5 * (samples[..., 1:] + samples[..., :-1]),
                     weights[..., 1:-1, 0],
-                    num_samples, randomly_sample=randomly_sample)
+                    num_samples, randomly_sample=randomly_sample).detach()
 
                 # combine the previously generates ray samples with the
                 # newly generated samples
@@ -644,7 +647,7 @@ class NeRF(nn.Module):
             # predict a density and color for every point along each ray
             # potentially add random noise to each density prediction
             density, color = self.forward(
-                points, unit_d[:, :max_n], stage=stage_idx,
+                points, unit_d[:, :max_n], stage_idx,
                 states_x=None if states_x is None else states_x[:, :max_n],
                 states_d=None if states_d is None else states_d[:, :max_n])
             density += torch.randn(density.shape,
