@@ -209,8 +209,8 @@ class NeRF(nn.Module):
         # directions are rotated by the given rotation matrix
         return camera_o, (camera_r * rays.unsqueeze(-2)).sum(dim=-1)
 
-    def sample_along_rays(self, rays_o, rays_d, near, far,
-                          num_samples, randomly_sample=True):
+    def sample_along_rays(self, rays_o, rays_d, near, far, num_samples,
+                          states_x=None, states_d=None, randomly_sample=True):
         """Generate a set of stratified samples along each ray by first
         splitting the ray into num_samples bins between near and far clipping
         planes, and then sampling uniformly from each bin
@@ -232,6 +232,12 @@ class NeRF(nn.Module):
         num_samples: int
             the number of samples along each ray to generate by sampling
             uniformly from num_samples bins between clipping planes
+        states_x: torch.Tensor
+            a batch of input vectors that represent the visual state of
+            objects in the scene, which affects density and color
+        states_d: torch.Tensor
+            a batch of input vectors that represent the visual state of
+            objects in the scene, which affects only the color
         randomly_sample: bool
             whether to randomly sample the evaluation positions along each
             ray or to use a deterministic set of points
@@ -268,12 +274,12 @@ class NeRF(nn.Module):
             samples = torch.rand(*samples.shape, **kwargs)
             samples = lower + (upper - lower) * samples
 
-        if self.learn_cdf_for_volume_sampling:
+        # pass samples through an inverse cdf transform
+        samples = self.inverse_transform(rays_o, rays_d, samples,
+                                         states_x=states_x,
+                                         states_d=states_d)
 
-            # pass samples through an inverse cdf transform
-            samples = self.inverse_transform(rays_o, rays_d, samples)
-
-        # scale samples between near and far clipping bounds
+        # scale samples between the near and far clipping planes
         samples = near + samples * (far - near)
 
         # generate points in 3D space along each ray using samples
@@ -316,8 +322,7 @@ class NeRF(nn.Module):
 
     def __init__(self, density_inputs=3, color_inputs=3, color_outputs=3,
                  hidden_size=256, x_positional_encoding_size=20,
-                 d_positional_encoding_size=12, normalize_position=1.0,
-                 learn_cdf_for_volume_sampling=False):
+                 d_positional_encoding_size=12, normalize_position=1.0):
         """Create a neural network model that learns a Neural Radiance Field
         by mapping positions and camera orientations in 3D space into the
         RBG and density values of a Neural Radiance Field (NeRF)
@@ -356,7 +361,6 @@ class NeRF(nn.Module):
         self.density_outputs = 1
         self.color_outputs = color_outputs
         self.normalize_position = normalize_position
-        self.learn_cdf_for_volume_sampling = learn_cdf_for_volume_sampling
 
         # record the size of inputs to the network and
         # corresponding positional encodings
@@ -371,6 +375,22 @@ class NeRF(nn.Module):
         self.density = nn.Linear(hidden_size, self.density_outputs)
         self.color = nn.Linear(hidden_size, self.color_outputs)
         self.hidden_size = hidden_size
+
+        # layers for parameterizing the cdf over ray samples
+        self.cdf_params = nn.Sequential(
+            nn.Linear(self.x_size + self.d_size, hidden_size),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, 2))
 
         # a neural network block that processes position
         self.block_0 = nn.Sequential(
@@ -411,21 +431,11 @@ class NeRF(nn.Module):
             nn.ReLU(),
             nn.LayerNorm(hidden_size))
 
-        # layers for parameterizing the cdf over points to sample
-        if learn_cdf_for_volume_sampling:
-            self.cdf_params = nn.Sequential(
-                nn.Linear(self.x_size + self.d_size, hidden_size),
-                nn.ReLU(),
-                nn.LayerNorm(hidden_size),
-                nn.Linear(hidden_size, hidden_size),
-                nn.ReLU(),
-                nn.LayerNorm(hidden_size),
-                nn.Linear(hidden_size, 2))
-
-    def inverse_transform(self, rays_o, rays_d, samples):
-        """Perform a forward pass on a Neural Radiance Field given a position
-        and viewing direction, and predict both the density of the position
-        and the color of the position and viewing direction
+    def inverse_transform(self, rays_o, rays_d,
+                          samples, states_x=None, states_d=None):
+        """Perform a forward pass on a learn transformation from a uniform
+        distribution of ray samples to a logistic distribution with a learned
+        mean and a learned scale parameter, via inverse transform sampling
 
         Arguments:
 
@@ -438,15 +448,18 @@ class NeRF(nn.Module):
         samples: torch.Tensor
             points sampled along each ray between the near and far clipping
             planes normalized between zero and one
+        states_x: torch.Tensor
+            a batch of input vectors that represent the visual state of
+            objects in the scene, which affects density and color
+        states_d: torch.Tensor
+            a batch of input vectors that represent the visual state of
+            objects in the scene, which affects only the color
 
         Returns:
 
-        density: torch.Tensor
-            an positive floating point tensor representing the density of the
-            shape at the current location in space independent to view
-        shape: torch.Tensor
-            an positive floating point tensor on [0, 1] representing the color
-            of at the current location in space dependent on view direction
+        points: torch.Tensor
+            num_samples points generated along each ray defined by rays_o
+            and rays_d using an inverse transformation by a learned cdf
 
         """
 
@@ -457,6 +470,16 @@ class NeRF(nn.Module):
         # embed the direction in a high dimensional positional encoding
         d_embed = self.positional_encoding(rays_d / torch.linalg.norm(
             rays_d, dim=-1, keepdim=True), self.d_positional_encoding_size)
+
+        # concatenate an additional state vector to the density inputs
+        if states_x is not None:
+            x_embed = torch.cat([self.positional_encoding(
+                states_x, self.x_positional_encoding_size), x_embed], dim=-1)
+
+        # concatenate an additional state vector to the density inputs
+        if states_d is not None:
+            d_embed = torch.cat([self.positional_encoding(
+                states_d, self.d_positional_encoding_size), d_embed], dim=-1)
 
         # perform a forward pass on several fully connected layers
         params = self.cdf_params(torch.cat([x_embed, d_embed], dim=-1))
@@ -578,6 +601,7 @@ class NeRF(nn.Module):
         kwargs = dict(dtype=rays_d.dtype, device=rays_d.device)
         points = self.sample_along_rays(rays_o, rays_d,
                                         near, far, num_samples,
+                                        states_x=states_x, states_d=states_d,
                                         randomly_sample=randomly_sample)
 
         # normalize the viewing direction of the camera and add
@@ -593,8 +617,8 @@ class NeRF(nn.Module):
 
         # predict a density and color for every point along each ray
         # potentially add random noise to each density prediction
-        density, color = self.forward(points, rays_d, states_x=states_x,
-                                      states_d=states_d)
+        density, color = self.forward(points, rays_d,
+                                      states_x=states_x, states_d=states_d)
         density += torch.randn(density.shape,
                                **kwargs) * density_noise_std
 
@@ -714,7 +738,8 @@ class NeRF(nn.Module):
         image = [self.render_rays(
             rays_o_i, rays_d_i, near, far, num_samples,
             states_x=None if states_x is None else states_i[0],
-            states_d=None if states_d is None else states_i[1],
+            states_d=None if states_d is None
+                     else states_i[0 if states_x is None else 1],
             randomly_sample=randomly_sample,
             density_noise_std=density_noise_std)
             for rays_o_i, rays_d_i, *states_i in zip(*batched_inputs)]
