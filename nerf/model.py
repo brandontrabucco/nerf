@@ -619,7 +619,8 @@ class NeRF(nn.Module):
 
         image_stages = []
 
-        # iterate through every stage of the nerf model from course to fine
+        # iterate through every stage from course to fine
+        # and generate images for every stage of nerf and return them all
         for stage_idx in range(self.num_stages):
 
             if stage_idx > 0: # only later stages invert the cdf

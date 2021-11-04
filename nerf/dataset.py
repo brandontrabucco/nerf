@@ -191,8 +191,8 @@ class PixelRayDataset(data.Dataset):
 
     """
 
-    def __init__(self, images, poses, focal_length,
-                 x_states=None, d_states=None):
+    def __init__(self, images, poses,
+                 focal_length, states_x=None, states_d=None):
         """Generate a dataset containing rays from a pinhole camera with the
         specified focal length with an imaging plane of size equal to the
         height and width of the provided images tensor
@@ -219,8 +219,8 @@ class PixelRayDataset(data.Dataset):
 
         self.images = images
         self.poses = poses
-        self.x_states = x_states
-        self.d_states = d_states
+        self.states_x = states_x
+        self.states_d = states_d
 
         # generate all possible rays to cast through the scene
         kwargs = dict(dtype=images.dtype, device=images.device)
@@ -295,11 +295,11 @@ class PixelRayDataset(data.Dataset):
         pose = self.poses[image_bi]
 
         # select the state if provided in the original dataset
-        x_state = (self.x_states[image_bi]
-                   if self.x_states is not None
+        state_x = (self.states_x[image_bi]
+                   if self.states_x is not None
                    else torch.zeros(0, device=pixel.device))
-        d_state = (self.d_states[image_bi]
-                   if self.d_states is not None
+        state_d = (self.states_d[image_bi]
+                   if self.states_d is not None
                    else torch.zeros(0, device=pixel.device))
 
         # then transform the given ray to world coordinates
@@ -308,7 +308,7 @@ class PixelRayDataset(data.Dataset):
         return dict(image_wi=torch.LongTensor([image_wi]).to(pixel.device),
                     image_hi=torch.LongTensor([image_hi]).to(pixel.device),
                     image_bi=torch.LongTensor([image_bi]).to(pixel.device),
-                    x_states=x_state, d_states=d_state,
+                    states_x=state_x, states_d=state_d,
                     pixels=pixel, rays=ray,
                     pose_o=pose_o, pose_d=rays_d,
                     rays_o=rays_o, rays_d=rays_d)
