@@ -1,10 +1,8 @@
 from nerf.model import NeRF
 from nerf.dataset import PixelRayDataset
 
-import matplotlib.pyplot as plt
 import pickle as pkl
 import numpy as np
-import cv2
 import os
 import io
 import argparse
