@@ -191,7 +191,7 @@ class PixelRayDataset(data.Dataset):
 
     """
 
-    def __init__(self, images, poses,
+    def __init__(self, images, segmentation, poses,
                  focal_length, states_x=None, states_d=None):
         """Generate a dataset containing rays from a pinhole camera with the
         specified focal length with an imaging plane of size equal to the
@@ -218,6 +218,7 @@ class PixelRayDataset(data.Dataset):
         """
 
         self.images = images
+        self.segmentation = segmentation
         self.poses = poses
         self.states_x = states_x
         self.states_d = states_d
@@ -291,6 +292,7 @@ class PixelRayDataset(data.Dataset):
 
         # select a pixel from the image and a corresponding ray
         pixel = self.images[image_bi, image_hi, image_wi]
+        label = self.segmentation[image_bi, image_hi, image_wi]
         ray = self.rays[image_hi, image_wi]
         pose = self.poses[image_bi]
 
@@ -309,6 +311,6 @@ class PixelRayDataset(data.Dataset):
                     image_hi=torch.LongTensor([image_hi]).to(pixel.device),
                     image_bi=torch.LongTensor([image_bi]).to(pixel.device),
                     states_x=state_x, states_d=state_d,
-                    pixels=pixel, rays=ray,
+                    pixels=pixel, label=label, rays=ray,
                     pose_o=pose_o, pose_d=rays_d,
                     rays_o=rays_o, rays_d=rays_d)
