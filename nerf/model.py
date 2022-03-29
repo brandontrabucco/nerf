@@ -263,7 +263,7 @@ class NeRF(nn.Module):
             samples = torch.rand(*samples.shape, **kwargs)
             samples = lower + (upper - lower) * samples
 
-        return samples * torch.linalg.norm(self.rays_max - self.rays_min)
+        return samples * 5.0
 
     @staticmethod
     def alpha_compositing_coefficients(points, density_outputs):
@@ -300,12 +300,12 @@ class NeRF(nn.Module):
             alpha[..., :-1, :] + 1e-10, dim=-2), (0, 0, 1, 0), value=1.0)
 
     def __init__(self, color_outputs=3, segmentation_outputs=50,
-                 hidden_size=128, positional_encoding_size=6,
+                 hidden_size=128, positional_encoding_size=64,
                  min_x=-20.0, max_x=20.0,
                  min_y=-20.0, max_y=20.0,
-                 min_z=-5.0, max_z=5.0,
-                 num_density_components=192, num_feature_components=192,
-                 bins_per_dimension=512, feature_size=27):
+                 min_z=-20.0, max_z=20.0,
+                 num_density_components=384, num_feature_components=384,
+                 bins_per_dimension=1024, feature_size=32):
         """Create a neural network model that learns a Neural Radiance Field
         by mapping positions and camera orientations in 3D space into the
         RBG and density values of a Neural Radiance Field (NeRF)
@@ -358,25 +358,18 @@ class NeRF(nn.Module):
         self.register_buffer("rays_max", torch.as_tensor(
             [[[max_x, max_y, max_z]]], dtype=torch.float32))
 
-        self.register_parameter("plane_coef", nn.Parameter(
+        self.register_parameter("coefficients", nn.Parameter(
             torch.randn(3, num_feature_components +
                         num_density_components,
                         bins_per_dimension,
-                        bins_per_dimension,
-                        dtype=torch.float32) * 0.1))
+                        1, dtype=torch.float32) * 0.01))
 
-        self.register_parameter("line_coef", nn.Parameter(
-            torch.randn(3, num_feature_components +
-                        num_density_components,
-                        bins_per_dimension,
-                        1, dtype=torch.float32) * 0.1))
-
-        self.feature_basis = nn.Linear(
-            num_feature_components * 3, feature_size, bias=False)
+        self.basis = nn.Linear(num_feature_components,
+                               feature_size, bias=False)
 
         self.prediction_heads = nn.Sequential(
-            nn.Linear(feature_size * (
-                1 + positional_encoding_size), hidden_size),
+            nn.Linear(feature_size +
+                      3 * positional_encoding_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
@@ -385,108 +378,11 @@ class NeRF(nn.Module):
             nn.Linear(hidden_size, color_outputs +
                       segmentation_outputs))
 
-    def resize_grid(self):
-        """Perform a forward pass on a Neural Radiance Field given a position
-        and viewing direction, and predict both the density of the position
-        and the color of the position and viewing direction
-
-        Arguments:
-
-        rays_x: torch.Tensor
-            an input vector that represents the positions in 3D space the
-            NeRF model is evaluated at, using a positional encoding
-        rays_d: torch.Tensor
-            an input vector that represents the viewing direction the NeRF
-            model is evaluated at, using a positional encoding
-        stage int
-            the stage of the nerf model to use during thie forward pass
-            where from zero to n the models run course to fine
-        states_x: torch.Tensor
-            a batch of input vectors that represent the visual state of
-            objects in the scene, which affects density and color
-        states_d: torch.Tensor
-            a batch of input vectors that represent the visual state of
-            objects in the scene, which affects only the color
-
-        Returns:
-
-        density: torch.Tensor
-            an positive floating point tensor representing the density of the
-            shape at the current location in space independent to view
-        shape: torch.Tensor
-            an positive floating point tensor on [0, 1] representing the color
-            of at the current location in space dependent on view direction
-
-        """
-
-        self.plane_coef[0, -self.num_density_components:]
-
-        self.line_coef[:, -self.num_density_components:]
-
-    def get_densities(self, locations):
-        """Perform a forward pass on a Neural Radiance Field given a position
-        and viewing direction, and predict both the density of the position
-        and the color of the position and viewing direction
-
-        Arguments:
-
-        rays_x: torch.Tensor
-            an input vector that represents the positions in 3D space the
-            NeRF model is evaluated at, using a positional encoding
-        rays_d: torch.Tensor
-            an input vector that represents the viewing direction the NeRF
-            model is evaluated at, using a positional encoding
-        stage int
-            the stage of the nerf model to use during thie forward pass
-            where from zero to n the models run course to fine
-        states_x: torch.Tensor
-            a batch of input vectors that represent the visual state of
-            objects in the scene, which affects density and color
-        states_d: torch.Tensor
-            a batch of input vectors that represent the visual state of
-            objects in the scene, which affects only the color
-
-        Returns:
-
-        density: torch.Tensor
-            an positive floating point tensor representing the density of the
-            shape at the current location in space independent to view
-        shape: torch.Tensor
-            an positive floating point tensor on [0, 1] representing the color
-            of at the current location in space dependent on view direction
-
-        """
-
-        batch_size, num_evaluations = locations.shape[:2]
-
-        locations = 2.0 * (locations - self.rays_min) / (self.rays_max - self.rays_min) - 1.0
-
-        coordinate_plane = torch.stack((locations[..., [0, 1]],
-                                        locations[..., [0, 2]],
-                                        locations[..., [1, 2]]))
-
-        coordinate_line = torch.stack((locations[..., 2],
-                                       locations[..., 1],
-                                       locations[..., 0]))
-
-        coordinate_line = torch.stack((
-            torch.zeros_like(coordinate_line), coordinate_line), dim=-1)
-
-        plane_feats = functional.grid_sample(
-            self.plane_coef[:, -self.num_density_components:],
-            coordinate_plane, align_corners=True).view(
-            3 * self.num_density_components, batch_size, num_evaluations)
-
-        plane_feats = plane_feats.permute(1, 2, 0)
-
-        line_feats = functional.grid_sample(
-            self.line_coef[:, -self.num_density_components:],
-            coordinate_line, align_corners=True).view(
-            3 * self.num_density_components, batch_size, num_evaluations)
-
-        line_feats = line_feats.permute(1, 2, 0)
-
-        return torch.sum(plane_feats * line_feats, dim=2, keepdim=True)
+    def upsample(self):
+        self.bins_per_dimension *= 2
+        self.coefficients = nn.Parameter(functional.interpolate(
+            self.coefficients.detach(), scale_factor=(
+                2, 1), mode='bilinear', align_corners=True))
 
     def forward(self, rays_x, rays_d, stage, states_x=None, states_d=None):
         """Perform a forward pass on a Neural Radiance Field given a position
@@ -526,57 +422,33 @@ class NeRF(nn.Module):
 
         rays_x = 2.0 * (rays_x - self.rays_min) / (self.rays_max - self.rays_min) - 1.0
 
-        coordinate_plane = torch.stack((rays_x[..., [0, 1]],
-                                        rays_x[..., [0, 2]],
-                                        rays_x[..., [1, 2]]))
-
-        coordinate_line = torch.stack((rays_x[..., 2],
+        coordinate_line = torch.stack((rays_x[..., 0],
                                        rays_x[..., 1],
-                                       rays_x[..., 0]))
+                                       rays_x[..., 2]), dim=0)
 
         coordinate_line = torch.stack((
             torch.zeros_like(coordinate_line), coordinate_line), dim=-1)
 
-        plane_feats = functional.grid_sample(
-            self.plane_coef[:, -self.num_density_components:],
-            coordinate_plane, align_corners=True).view(
-            3 * self.num_density_components, batch_size, num_evaluations)
+        line_feats = functional.grid_sample(
+            self.coefficients[:, -self.num_density_components:],
+            coordinate_line, align_corners=True, mode='bilinear')
 
-        plane_feats = plane_feats.permute(1, 2, 0)
+        line_feats = torch.prod(line_feats, dim=0).permute(1, 2, 0)
+
+        location_density = torch.sum(line_feats, dim=2, keepdim=True)
 
         line_feats = functional.grid_sample(
-            self.line_coef[:, -self.num_density_components:],
-            coordinate_line, align_corners=True).view(
-            3 * self.num_density_components, batch_size, num_evaluations)
+            self.coefficients[:, :self.num_feature_components],
+            coordinate_line, align_corners=True, mode='bilinear')
 
-        line_feats = line_feats.permute(1, 2, 0)
-
-        location_density = torch.sum(plane_feats * line_feats, dim=2, keepdim=True)
-
-        plane_feats = functional.grid_sample(
-            self.plane_coef[:, :self.num_feature_components],
-            coordinate_plane, align_corners=True).view(
-            3 * self.num_feature_components, batch_size, num_evaluations)
-
-        plane_feats = plane_feats.permute(1, 2, 0)
-
-        line_feats = functional.grid_sample(
-            self.line_coef[:, :self.num_feature_components],
-            coordinate_line, align_corners=True).view(
-            3 * self.num_feature_components, batch_size, num_evaluations)
-
-        line_feats = line_feats.permute(1, 2, 0)
-
-        location_feature = self.feature_basis(plane_feats * line_feats)
+        line_feats = self.basis(torch.prod(line_feats, dim=0).permute(1, 2, 0))
 
         head_predictions = self.prediction_heads(
-            torch.cat([location_feature, self.positional_encoding(
-                location_feature.detach(), self.positional_encoding_size)], dim=-1))
+            torch.cat([line_feats, self.positional_encoding(
+                rays_x, self.positional_encoding_size)], dim=-1))
 
         color, segmentation = head_predictions.split([
             self.color_outputs, self.segmentation_outputs], dim=2)
-
-        self.regularization = location_density
 
         return location_density, color, segmentation
 
@@ -670,7 +542,7 @@ class NeRF(nn.Module):
             torch.stack(segmentation_stages, dim=-2)
 
     def render_image(self, camera_o, camera_r, image_h, image_w, focal_length,
-                     num_samples, states_x=None, states_d=None, max_chunk_size=128,
+                     num_samples, states_x=None, states_d=None, max_chunk_size=256,
                      randomly_sample=False, density_noise_std=0.0):
         """Render an image with the specified height and width using a camera
         with the specified pose and focal length using a neural radiance
