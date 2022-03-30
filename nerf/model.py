@@ -4,6 +4,165 @@ import torch.nn as nn
 import torch.nn.functional as functional
 
 
+class ResidualBlock(nn.Module):
+
+    def __init__(self, hidden_size, feedforward_size):
+
+        super(ResidualBlock, self).__init__()
+
+        self.linear_one = nn.Linear(hidden_size, feedforward_size)
+        self.activation = nn.GELU()
+        self.linear_two = nn.Linear(feedforward_size, hidden_size)
+        self.layer_norm = nn.LayerNorm(hidden_size)
+
+    def forward(self, x):
+
+        h = self.linear_two(self.activation(self.linear_one(x)))
+        return self.layer_norm(x + h)
+
+
+def expected_sin(x, x_var):
+  """Estimates mean and variance of sin(z), z ~ N(x, var)."""
+  # When the variance is wide, shrink sin towards zero.
+  y = torch.exp(-0.5 * x_var) * torch.sin(x)
+  y_var = (0.5 * (1 - torch.exp(-2 * x_var) *
+                  torch.cos(2 * x)) - y**2).clamp(min=0.0)
+  return y, y_var
+
+
+def lift_gaussian(d, t_mean, t_var, r_var, diag):
+  """Lift a Gaussian defined along a ray to 3D coordinates."""
+  mean = d[..., None, :] * t_mean[..., None]
+
+  d_mag_sq = torch.sum(d**2, dim=-1, keepdim=True).clamp(min=1e-10)
+
+  if diag:
+    d_outer_diag = d**2
+    null_outer_diag = 1 - d_outer_diag / d_mag_sq
+    t_cov_diag = t_var[..., None] * d_outer_diag[..., None, :]
+    xy_cov_diag = r_var[..., None] * null_outer_diag[..., None, :]
+    cov_diag = t_cov_diag + xy_cov_diag
+    return mean, cov_diag
+  else:
+    d_outer = d[..., :, None] * d[..., None, :]
+    eye = jnp.eye(d.shape[-1])
+    null_outer = eye - d[..., :, None] * (d / d_mag_sq)[..., None, :]
+    t_cov = t_var[..., None, None] * d_outer[..., None, :, :]
+    xy_cov = r_var[..., None, None] * null_outer[..., None, :, :]
+    cov = t_cov + xy_cov
+    return mean, cov
+
+
+def conical_frustum_to_gaussian(d, t0, t1, base_radius, diag, stable=True):
+  """Approximate a conical frustum as a Gaussian distribution (mean+cov).
+
+  Assumes the ray is originating from the origin, and base_radius is the
+  radius at dist=1. Doesn't assume `d` is normalized.
+
+  Args:
+    d: jnp.float32 3-vector, the axis of the cone
+    t0: float, the starting distance of the frustum.
+    t1: float, the ending distance of the frustum.
+    base_radius: float, the scale of the radius as a function of distance.
+    diag: boolean, whether or the Gaussian will be diagonal or full-covariance.
+    stable: boolean, whether or not to use the stable computation described in
+      the paper (setting this to False will cause catastrophic failure).
+
+  Returns:
+    a Gaussian (mean and covariance).
+  """
+  if stable:
+    mu = (t0 + t1) / 2
+    hw = (t1 - t0) / 2
+    t_mean = mu + (2 * mu * hw**2) / (3 * mu**2 + hw**2)
+    t_var = (hw**2) / 3 - (4 / 15) * ((hw**4 * (12 * mu**2 - hw**2)) /
+                                      (3 * mu**2 + hw**2)**2)
+    r_var = base_radius**2 * ((mu**2) / 4 + (5 / 12) * hw**2 - 4 / 15 *
+                              (hw**4) / (3 * mu**2 + hw**2))
+  else:
+    t_mean = (3 * (t1**4 - t0**4)) / (4 * (t1**3 - t0**3))
+    r_var = base_radius**2 * (3 / 20 * (t1**5 - t0**5) / (t1**3 - t0**3))
+    t_mosq = 3 / 5 * (t1**5 - t0**5) / (t1**3 - t0**3)
+    t_var = t_mosq - t_mean**2
+  return lift_gaussian(d, t_mean, t_var, r_var, diag)
+
+
+def cylinder_to_gaussian(d, t0, t1, radius, diag):
+  """Approximate a cylinder as a Gaussian distribution (mean+cov).
+
+  Assumes the ray is originating from the origin, and radius is the
+  radius. Does not renormalize `d`.
+
+  Args:
+    d: jnp.float32 3-vector, the axis of the cylinder
+    t0: float, the starting distance of the cylinder.
+    t1: float, the ending distance of the cylinder.
+    radius: float, the radius of the cylinder
+    diag: boolean, whether or the Gaussian will be diagonal or full-covariance.
+
+  Returns:
+    a Gaussian (mean and covariance).
+  """
+  t_mean = (t0 + t1) / 2
+  r_var = radius**2 / 4
+  t_var = (t1 - t0)**2 / 12
+  return lift_gaussian(d, t_mean, t_var, r_var, diag)
+
+
+def cast_rays(t_vals, origins, directions, radii, ray_shape, diag=True):
+  """Cast rays (cone- or cylinder-shaped) and featurize sections of it.
+
+  Args:
+    t_vals: float array, the "fencepost" distances along the ray.
+    origins: float array, the ray origin coordinates.
+    directions: float array, the ray direction vectors.
+    radii: float array, the radii (base radii for cones) of the rays.
+    ray_shape: string, the shape of the ray, must be 'cone' or 'cylinder'.
+    diag: boolean, whether or not the covariance matrices should be diagonal.
+
+  Returns:
+    a tuple of arrays of means and covariances.
+  """
+  t0 = t_vals[..., :-1]
+  t1 = t_vals[..., 1:]
+  if ray_shape == 'cone':
+    gaussian_fn = conical_frustum_to_gaussian
+  elif ray_shape == 'cylinder':
+    gaussian_fn = cylinder_to_gaussian
+  else:
+    assert False
+  means, covs = gaussian_fn(directions, t0, t1, radii, diag)
+  means = means + origins[..., None, :]
+  return means, covs
+
+
+def integrated_pos_enc(x_coord, min_deg, max_deg):
+    """Encode `x` with sinusoids scaled by 2^[min_deg:max_deg-1].
+
+    Args:
+        x_coord: a tuple containing: x, jnp.ndarray, variables to be encoded. Should
+            be in [-pi, pi]. x_cov, jnp.ndarray, covariance matrices for `x`.
+        min_deg: int, the min degree of the encoding.
+        max_deg: int, the max degree of the encoding.
+        diag: bool, if true, expects input covariances to be diagonal (full
+            otherwise).
+
+    Returns:
+        encoded: jnp.ndarray, encoded variables.
+    """
+
+    x, x_cov_diag = x_coord
+    scales = torch.as_tensor([2**i for i in range(
+        min_deg, max_deg)]).to(dtype=x.dtype, device=x.device)
+    shape = list(x.shape[:-1]) + [-1]
+    y = (x[..., None, :] * scales[:, None]).reshape(*shape)
+    y_var = (x_cov_diag[..., None, :] * scales[:, None]**2).reshape(*shape)
+
+    return expected_sin(
+        torch.cat([y, y + 0.5 * np.pi], dim=-1),
+        torch.cat([y_var] * 2, dim=-1))[0]
+
+
 class NeRF(nn.Module):
     """Create a neural network model that learns a Neural Radiance Field
     by mapping positions and camera orientations in 3D space into the
@@ -35,8 +194,7 @@ class NeRF(nn.Module):
 
     """
 
-    @staticmethod
-    def positional_encoding(x, size):
+    def positional_encoding(self, x, diag_covariance, size):
         """Generate a positional embedding of size d_model for a tensor by
         treating the last dimension as a sequence of scalars and using
         their value as the position in a positional embedding
@@ -55,18 +213,28 @@ class NeRF(nn.Module):
 
         """
 
+        starting_frequency = -torch.log2(
+            torch.maximum(self.rays_max.abs().amax(),
+                          self.rays_min.abs().amax()))
+
         # generate frequency scales for a sequence of sine waves
-        idx = torch.arange(0, size // 2).to(dtype=x.dtype, device=x.device)
-        frequency_scale = torch.pow(2.0, idx) * np.pi
+        frequency_scale = torch.pow(2.0, torch.linspace(
+            starting_frequency,
+            starting_frequency + size / 2 - 1.0,
+            size // 2, dtype=x.dtype, device=x.device)) * np.pi / 2
 
         # ensure x and frequency_scale have the same tensor shape
         x = x.unsqueeze(-1)
         while len(frequency_scale.shape) < len(x.shape):
             frequency_scale = frequency_scale.unsqueeze(0)
 
+        amplitude = torch.exp(-0.5 * (frequency_scale ** 2) *
+                              diag_covariance.unsqueeze(-1))
+
         # generate a sine and cosine embedding for each value in x
-        embedding = torch.cat([torch.sin(x * frequency_scale),
-                               torch.cos(x * frequency_scale)], dim=-1)
+        embedding = torch.cat([
+            torch.sin(x * frequency_scale),
+            torch.cos(x * frequency_scale)], dim=-1)
 
         # flatten the features and positional embedding axes
         return torch.flatten(embedding, start_dim=-2, end_dim=-1)
@@ -243,7 +411,8 @@ class NeRF(nn.Module):
         # to the same device with the same data type as rays_o
         reshape_shape = [1 for _ in range(len(rays_o.shape[:-1]))]
         kwargs = dict(dtype=rays_o.dtype, device=rays_o.device)
-        samples = torch.linspace(0.0, 1.0, num_samples, **kwargs)
+        samples = torch.pow(2.0, torch.linspace(-9.43633744014, 0.0,
+                                                num_samples, **kwargs))
 
         # broadcast the sample bins to a compatible shape with rays_o
         samples = samples.reshape(*(reshape_shape + [num_samples]))
@@ -263,7 +432,7 @@ class NeRF(nn.Module):
             samples = torch.rand(*samples.shape, **kwargs)
             samples = lower + (upper - lower) * samples
 
-        return samples * 5.0
+        return samples * torch.linalg.norm(self.rays_max - self.rays_min)
 
     @staticmethod
     def alpha_compositing_coefficients(points, density_outputs):
@@ -300,12 +469,10 @@ class NeRF(nn.Module):
             alpha[..., :-1, :] + 1e-10, dim=-2), (0, 0, 1, 0), value=1.0)
 
     def __init__(self, color_outputs=3, segmentation_outputs=50,
-                 hidden_size=128, positional_encoding_size=64,
+                 hidden_size=256, encoding_size=32, focal_length=112.0,
                  min_x=-20.0, max_x=20.0,
                  min_y=-20.0, max_y=20.0,
-                 min_z=-20.0, max_z=20.0,
-                 num_density_components=384, num_feature_components=384,
-                 bins_per_dimension=1024, feature_size=32):
+                 min_z=-20.0, max_z=20.0):
         """Create a neural network model that learns a Neural Radiance Field
         by mapping positions and camera orientations in 3D space into the
         RBG and density values of a Neural Radiance Field (NeRF)
@@ -341,16 +508,13 @@ class NeRF(nn.Module):
 
         super(NeRF, self).__init__()
 
+        self.focal_length = focal_length
+
         self.color_outputs = color_outputs
         self.segmentation_outputs = segmentation_outputs
 
         self.hidden_size = hidden_size
-        self.positional_encoding_size = positional_encoding_size
-
-        self.num_density_components = num_density_components
-        self.num_feature_components = num_feature_components
-        self.bins_per_dimension = bins_per_dimension
-        self.feature_size = feature_size
+        self.encoding_size = encoding_size
 
         self.register_buffer("rays_min", torch.as_tensor(
             [[[min_x, min_y, min_z]]], dtype=torch.float32))
@@ -358,33 +522,35 @@ class NeRF(nn.Module):
         self.register_buffer("rays_max", torch.as_tensor(
             [[[max_x, max_y, max_z]]], dtype=torch.float32))
 
-        self.register_parameter("coefficients", nn.Parameter(
-            torch.randn(3, num_feature_components +
-                        num_density_components,
-                        bins_per_dimension,
-                        1, dtype=torch.float32) * 0.01))
-
-        self.basis = nn.Linear(num_feature_components,
-                               feature_size, bias=False)
-
         self.prediction_heads = nn.Sequential(
-            nn.Linear(feature_size +
-                      3 * positional_encoding_size, hidden_size),
+            nn.Linear(3 * encoding_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
-            nn.Linear(hidden_size, color_outputs +
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1 + color_outputs +
                       segmentation_outputs))
 
-    def upsample(self):
-        self.bins_per_dimension *= 2
-        self.coefficients = nn.Parameter(functional.interpolate(
-            self.coefficients.detach(), scale_factor=(
-                2, 1), mode='bilinear', align_corners=True))
+    def integrated_pe(self, rays_o, rays_d, samples):
 
-    def forward(self, rays_x, rays_d, stage, states_x=None, states_d=None):
+        r_dot = 1 / (np.sqrt(3) * self.focal_length)
+
+        means, covs = cast_rays(samples, rays_o, rays_d, r_dot, "cone")
+
+        return means, covs, integrated_pos_enc(
+            (means, covs), -4, self.encoding_size // 2 - 4)
+
+    def forward(self, rays_o, rays_d, samples, states_x=None, states_d=None):
         """Perform a forward pass on a Neural Radiance Field given a position
         and viewing direction, and predict both the density of the position
         and the color of the position and viewing direction
@@ -418,39 +584,14 @@ class NeRF(nn.Module):
 
         """
 
-        batch_size, num_evaluations = rays_x.shape[:2]
+        mean, diag_covariance, h = self.integrated_pe(rays_o, rays_d, samples)
 
-        rays_x = 2.0 * (rays_x - self.rays_min) / (self.rays_max - self.rays_min) - 1.0
+        head_predictions = self.prediction_heads(h)
 
-        coordinate_line = torch.stack((rays_x[..., 0],
-                                       rays_x[..., 1],
-                                       rays_x[..., 2]), dim=0)
+        density, color, segmentation = head_predictions.split([
+            1, self.color_outputs, self.segmentation_outputs], dim=2)
 
-        coordinate_line = torch.stack((
-            torch.zeros_like(coordinate_line), coordinate_line), dim=-1)
-
-        line_feats = functional.grid_sample(
-            self.coefficients[:, -self.num_density_components:],
-            coordinate_line, align_corners=True, mode='bilinear')
-
-        line_feats = torch.prod(line_feats, dim=0).permute(1, 2, 0)
-
-        location_density = torch.sum(line_feats, dim=2, keepdim=True)
-
-        line_feats = functional.grid_sample(
-            self.coefficients[:, :self.num_feature_components],
-            coordinate_line, align_corners=True, mode='bilinear')
-
-        line_feats = self.basis(torch.prod(line_feats, dim=0).permute(1, 2, 0))
-
-        head_predictions = self.prediction_heads(
-            torch.cat([line_feats, self.positional_encoding(
-                rays_x, self.positional_encoding_size)], dim=-1))
-
-        color, segmentation = head_predictions.split([
-            self.color_outputs, self.segmentation_outputs], dim=2)
-
-        return location_density, color, segmentation
+        return mean, density, color, segmentation
 
     def render_rays(self, rays_o, rays_d, num_samples,
                     states_x=None, states_d=None,
@@ -499,38 +640,23 @@ class NeRF(nn.Module):
 
         # generate samples along each ray
         samples = previous_samples = self.sample_along_rays(
-            rays_o, rays_d, num_samples, states_x=states_x,
-            states_d=states_d, randomly_sample=randomly_sample)
-
-        # normalize the viewing direction of the camera and add
-        # an additional dimension of ray samples
-        unit_d = torch.broadcast_to(rays_d.unsqueeze(-2),
-                                    [rays_d.shape[0], num_samples * 2, 3])
-        if states_x is not None:
-            states_x = torch.broadcast_to(states_x.unsqueeze(
-                -2), [rays_d.shape[0], num_samples * 2, states_x.shape[-1]])
-        if states_d is not None:
-            states_d = torch.broadcast_to(states_d.unsqueeze(
-                -2), [rays_d.shape[0], num_samples * 2, states_d.shape[-1]])
+            rays_o, rays_d, num_samples, randomly_sample=randomly_sample)
 
         image_stages, segmentation_stages = [], []
 
-        # generate points in 3D space along each ray using samples
-        points = (rays_o.unsqueeze(-2) +
-                  rays_d.unsqueeze(-2) * samples.unsqueeze(-1))
-
         # predict a density and color for every point along each ray
         # potentially add random noise to each density prediction
-        density, color, segmentation = self.forward(
-            points, unit_d[:, :num_samples], 0,
-            states_x=None if states_x is None else states_x[:, :num_samples],
-            states_d=None if states_d is None else states_d[:, :num_samples])
-        density = density + torch.randn(density.shape, dtype=density.dtype,
-                                        device=density.device) * density_noise_std
+        points, density, color, segmentation = self.forward(
+            rays_o, rays_d, samples)
+
+        density = density + torch.randn(
+            density.shape, dtype=density.dtype,
+            device=density.device) * density_noise_std
 
         # generate alpha compositing coefficients along each ray and
         # and composite the color values onto the imaging plane
         weights = self.alpha_compositing_coefficients(points, density)
+
         image_stages.append((weights * torch.sigmoid(color)).sum(dim=-2))
         segmentation_stages.append((torch.log(
             weights + 1e-10) + torch.log_softmax(
@@ -542,7 +668,7 @@ class NeRF(nn.Module):
             torch.stack(segmentation_stages, dim=-2)
 
     def render_image(self, camera_o, camera_r, image_h, image_w, focal_length,
-                     num_samples, states_x=None, states_d=None, max_chunk_size=256,
+                     num_samples, states_x=None, states_d=None, max_chunk_size=1024,
                      randomly_sample=False, density_noise_std=0.0):
         """Render an image with the specified height and width using a camera
         with the specified pose and focal length using a neural radiance
@@ -615,17 +741,6 @@ class NeRF(nn.Module):
         camera_r = torch.broadcast_to(camera_r.unsqueeze(
             1).unsqueeze(1), [batch_size, image_h, image_w, 3, 3])
 
-        # broadcast the states of the radiance field to the correct shape
-        # accounting for the number of raysd being cast
-        if states_x is not None:
-            states_x = torch.broadcast_to(states_x.unsqueeze(
-                1).unsqueeze(1), [batch_size, image_h,
-                                  image_w, states_x.shape[-1]])
-        if states_d is not None:
-            states_d = torch.broadcast_to(states_d.unsqueeze(
-                1).unsqueeze(1), [batch_size, image_h,
-                                  image_w, states_d.shape[-1]])
-
         # transform the rays to the world coordinate system using pose
         rays_o, rays_d = self\
             .rays_to_world_coordinates(rays, camera_o, camera_r)
@@ -637,24 +752,13 @@ class NeRF(nn.Module):
         batched_inputs = [torch.split(rays_o, max_chunk_size),
                           torch.split(rays_d, max_chunk_size)]
 
-        # if visual states are provided that also create shards for
-        # these tensors and add them to the batch
-        if states_x is not None:
-            batched_inputs.append(torch.split(torch.flatten(
-                states_x, start_dim=0, end_dim=2), max_chunk_size))
-        if states_d is not None:
-            batched_inputs.append(torch.split(torch.flatten(
-                states_d, start_dim=0, end_dim=2), max_chunk_size))
-
         # an inner function that wraps the volume rendering process for
         # each pixel, and then append pixels to an image buffer
         image = [[x[:, -1] for x in self.render_rays(
             rays_o_i, rays_d_i, num_samples,
             randomly_sample=randomly_sample,
-            density_noise_std=density_noise_std,
-            states_x=None if states_x is None else states_i[0],
-            states_d=None if states_d is None else states_i[-1])]
-            for rays_o_i, rays_d_i, *states_i in zip(*batched_inputs)]
+            density_noise_std=density_noise_std)]
+            for rays_o_i, rays_d_i in zip(*batched_inputs)]
 
         image, segmentation = zip(*image)
 
